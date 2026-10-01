@@ -1,0 +1,7 @@
+BEGIN;
+
+-- DES-20261001-01 §12.1「A11 管理后台监控告警」— 回滚 000040。
+
+DROP TABLE IF EXISTS admin_alerts;
+
+COMMIT;

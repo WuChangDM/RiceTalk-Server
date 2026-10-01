@@ -1,0 +1,56 @@
+# RidgeRiceTalk 每日备份 systemd oneshot 服务模板
+# 由 deploy-baremetal.sh Stage 7 渲染（sed 替换模板中的占位符）后安装到 /etc/systemd/system/。
+# Placeholders:
+#   {{SERVER_DIR}}  — 服务端目录（默认 /opt/ridgericetalk/server），
+#                     备份脚本位于其 scripts/ 下（backup-db.sh / backup-storage.sh）
+#
+# 单元用途：依次执行 backup-db.sh（pg_dump -Fc + 自检）与 backup-storage.sh
+#           （打包 storage + 自检）。两个脚本失败时都会非 0 退出并自删坏产物。
+# 由同名的 ridgericetalk-backup.timer 每日触发；只需 enable timer，不要 enable 本服务。
+#
+# 为什么不用「多行 ExecStart + '-' 前缀」：
+#   Type=oneshot 允许多行 ExecStart，但 systemd 默认语义是「前一条失败即中止后续」；
+#   给单条加 '-' 前缀虽能让后续继续执行，却会把这次失败从单元结果里抹掉（单元仍算成功）。
+#   定时备份最怕「坏了没人知道」，因此这里用单个 /bin/bash -c 把两个脚本包起来：
+#   无论前一个是否失败都继续跑后一个，最后把非 0 退出码透出给 systemd，
+#   于是 `systemctl status ridgericetalk-backup`（failed）/ `journalctl -u ridgericetalk-backup`
+#   都能看到失败。这样既「两个都跑完」，又「整体退出码反映失败」。
+#
+# 为什么不做 systemd 沙箱加固（ProtectSystem/ProtectHome/NoNewPrivileges 等）：
+#   备份需要读取 0600 的 .env.production、以 root 经 runuser 切到 postgres 走 peer 认证，
+#   并向 /var/backups/ridgericetalk 写产物 —— 均与严格沙箱冲突。本服务以 root 运行、
+#   只读业务数据、只写备份目录，故不加沙箱（参照 deploy-baremetal.sh 中其它单元也各按需裁剪）。
+
+[Unit]
+Description=RidgeRiceTalk Daily Backup (database + storage)
+Documentation=https://github.com/WuChangDM/RidgeRiceTalk-Sever
+# 数据库备份依赖本机 PostgreSQL；用 Wants（而非 Requires）避免 DB 未就绪时整个 timer 被牵连失败
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+# 必须以 root 运行：读 0600 的 .env.production、runuser 切 postgres、写 /var/backups
+User=root
+Group=root
+
+# 两个脚本都执行；任一失败则整体非 0 退出（见文件头说明）
+# 注意：ExecStart 里的 $$ 是 systemd 的转义 —— systemd 会把 $VAR 当作它自己的
+#       环境变量做替换，故必须写成 $$?/$$rc 才能把字面量 $?/$rc 交给 bash，
+#       否则未被定义的 $rc 会被替换成空串、失败码被吞掉。此处不要「顺手简化」。
+ExecStart=/bin/bash -c 'rc=0; {{SERVER_DIR}}/scripts/backup-db.sh || rc=$$?; {{SERVER_DIR}}/scripts/backup-storage.sh || rc=$$?; exit $$rc'
+
+# 备份不应与业务抢资源：尽最低 CPU 优先级 + 磁盘空闲 IO 调度类别（备份可让路）
+Nice=10
+IOSchedulingClass=idle
+
+# 大库 dump 可能耗时较久，放宽启动超时（Type=oneshot 默认值偏紧）
+TimeoutStartSec=1800
+
+# 日志统一进 journald，便于 `journalctl -u ridgericetalk-backup` 查看
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ridgericetalk-backup
+
+# 说明：本单元不提供 [Install]（不 enable 服务本体）。
+# 触发由 ridgericetalk-backup.timer 负责；若显式 enable 本服务会在每次开机立即跑一次备份。

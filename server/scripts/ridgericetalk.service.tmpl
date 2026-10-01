@@ -1,0 +1,74 @@
+# RidgeRiceTalk systemd service template
+# This file is rendered by scripts/install-service.sh. Placeholders:
+#   {{EXEC_START}}      — absolute path to the server binary (e.g. /opt/ridgericetalk/server)
+#   {{WORKING_DIR}}     — working directory (e.g. /opt/ridgericetalk)
+#   {{USER}}            — unprivileged user to run as (e.g. ridgericetalk)
+#   {{ENV_FILE}}        — absolute path to .env.production (e.g. /opt/ridgericetalk/.env.production)
+#
+# After rendering, install with:
+#   sudo cp ridgericetalk.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ridgericetalk
+
+[Unit]
+Description=RidgeRiceTalk Server
+Documentation=https://github.com/your-org/ridgericetalk
+After=network-online.target postgresql.service
+Wants=network-online.target
+# Start limit must live in [Unit] on systemd >= 240
+StartLimitBurst=3
+StartLimitIntervalSec=60
+# If PostgreSQL runs on the same host, ensure it is up first.
+# For remote PostgreSQL, remove the postgresql.service dependency.
+# NeteaseCloudMusicApi 由后端内嵌管理，不再需要独立的 netease-api.service。
+
+[Service]
+Type=simple
+User={{USER}}
+Group={{USER}}
+WorkingDirectory={{WORKING_DIR}}
+EnvironmentFile={{ENV_FILE}}
+
+ExecStart={{EXEC_START}}
+
+# 让内嵌 NeteaseCloudMusicApi 子进程在 ProtectHome=true 下也能使用 npm
+# NPM_CONFIG_CACHE 必须指向 ReadWritePaths 内的可写目录，否则 npm install 会报 EROFS
+Environment=HOME=/var/lib/ridgericetalk NPM_CONFIG_CACHE={{DEPLOY_DIR}}/services/netease-api/.npm
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Graceful shutdown
+KillSignal=SIGINT
+TimeoutStopSec=30s
+
+# Resource limits (adjust per deployment)
+LimitNOFILE=65536
+MemoryMax=2G
+CPUQuota=200%
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{WORKING_DIR}}/server/storage {{WORKING_DIR}}/server/logs {{WORKING_DIR}}/server/webhost/dist {{WORKING_DIR}}/services/netease-api {{WORKING_DIR}}/server/models
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ridgericetalk
+
+[Install]
+WantedBy=multi-user.target

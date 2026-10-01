@@ -1,0 +1,18 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.log
+
+# 测试产物
+test-results/
+playwright-report/
+
+# 已归档/废弃，不纳入版本控制（见根 CLAUDE.md）
+# - web/voice：网页版 voice 主应用，2026-09-09 归档到 归档数据/，目录仅剩 node_modules
+# - web/web-win.archived-20260630：早期 UI 原型，已废弃
+voice/
+web-win.archived-20260630/
+
+# 本地环境文件
+.env
+.env.local

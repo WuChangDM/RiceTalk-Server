@@ -1,0 +1,59 @@
+# LiveKit Server systemd service template
+# Rendered by deploy-baremetal.sh
+# Placeholders:
+#   {{EXEC_START}}    — path to livekit-server binary
+#   {{CONFIG_PATH}}   — path to livekit.yaml (rendered by backend)
+#   {{USER}}          — unprivileged user
+#   {{WORKING_DIR}}   — working directory
+
+[Unit]
+Description=LiveKit Server for RidgeRiceTalk
+After=ridgericetalk.service network-online.target
+Wants=network-online.target
+# LiveKit depends on the livekit.yaml rendered by ridgericetalk service on first boot.
+
+[Service]
+Type=simple
+User={{USER}}
+Group={{USER}}
+WorkingDirectory={{WORKING_DIR}}
+
+ExecStart={{EXEC_START}} --config {{CONFIG_PATH}}
+
+# Wait for config file to be rendered by backend
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -f {{CONFIG_PATH}} ] && exit 0; sleep 1; done; echo "livekit.yaml not found after 60s"; exit 1'
+
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+KillSignal=SIGINT
+TimeoutStopSec=30s
+
+LimitNOFILE=65536
+MemoryMax=512M
+CPUQuota=100%
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{WORKING_DIR}}
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=livekit
+
+[Install]
+WantedBy=multi-user.target

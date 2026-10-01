@@ -1,0 +1,29 @@
+# RidgeRiceTalk 每日备份 systemd timer 模板
+# 由 deploy-baremetal.sh Stage 7 渲染后安装到 /etc/systemd/system/。
+# 无占位符（纯静态）。
+#
+# 触发策略：
+#   - OnCalendar=*-*-* 04:17:00 —— 每日 04:17（systemd 本地时区；本机为 UTC）。
+#     刻意避开整点/半点：整点是 logrotate、dpkg-db-backup、sysstat、man-db 等系统
+#     定时任务的聚集时刻，错峰可避免 IO 与 CPU 争抢。
+#   - RandomizedDelaySec=30min —— 在 04:17 基础上再加最多 30 分钟随机延迟
+#     （实际落在 04:17–04:47），多机部署时避免同时开跑，也进一步错开其它任务。
+#   - Persistent=true —— 到点机器关机/离线而错过时，下次开机补跑一次，避免漏备份。
+#   - AccuracySec=1min —— 默认 1 分钟即可（已有随机延迟分散负载）。
+#
+# 只 `systemctl enable --now ridgericetalk-backup.timer`，不要 enable 服务本体。
+
+[Unit]
+Description=Daily RidgeRiceTalk backup timer (database + storage)
+Documentation=https://github.com/WuChangDM/RidgeRiceTalk-Sever
+
+[Timer]
+# 关联的 oneshot 服务（省略 .service 后缀）
+Unit=ridgericetalk-backup.service
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=30min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+{
+  "email": "user@example.com",
+  "username": "User",
+  "displayName": "User",
+  "password": "User@2026!!Secure",
+  "securityQuestions": [
+    {"question": "您出生城市是哪里？", "answer": "上海"}
+  ]
+}

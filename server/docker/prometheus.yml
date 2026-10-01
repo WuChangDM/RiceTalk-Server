@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # 开发环境：RidgeRiceTalk 后端运行在宿主机（或单独的 app 容器）。
+  # /metrics 受 admin JWT 保护，实际抓取需要配置 bearer_token 或关闭认证。
+  # 默认 target 使用 127.0.0.1，macOS/Windows 可直接解析；
+  # Linux 用户可将 target 改为宿主网关 IP（如 172.17.0.1:8080）。
+  - job_name: 'ridgericetalk'
+    static_configs:
+      - targets: ['127.0.0.1:8080']
+    metrics_path: '/metrics'
+    # 如需认证，取消下面注释并替换 token：
+    # authorization:
+    #   type: Bearer
+    #   credentials: '<admin-jwt-token>'
+
+  - job_name: 'livekit'
+    static_configs:
+      - targets: ['livekit:6789']
