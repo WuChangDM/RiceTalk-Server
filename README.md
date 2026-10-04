@@ -2,7 +2,6 @@
 
 > RidgeRiceTalk 的 Go 服务端子仓库，提供 REST API、WebSocket、语音（LiveKit）、Bots、文件、协作功能模块。
 
-本 README 描述本仓库的目录结构与模块职责。完整 Agent 行为规范见 [../AGENTS.md](file:///c:/RICETALK/AGENTS.md)，项目总览见 [../README.md](file:///c:/RICETALK/README.md)。
 
 ## 仓库职责定位
 
@@ -83,36 +82,22 @@ Windows 桌面客户端（RiceTalk）不随本仓库分发，统一从 GitHub Re
 ## 目录结构
 
 ```
-ridgericetalk/
-├── docs/                          # 仓库级文档
-│   └── CHANGELOG.md               # 本仓库变更日志
-├── livekit/                       # LiveKit Server 配置模板
-│   └── livekit.yaml.template      # LiveKit 配置模板（含 {{TCP_PORT}} 等模板变量）
-├── music-bot-worker/              # Node.js 音乐播放 Worker（LiveKit Agents、FFmpeg、队列控制）
-├── migrations/                    # 数据库迁移文件（golang-migrate 格式，up/down 配对）
-├── scripts/                       # 仓库根级辅助脚本
-│   ├── fix_openapi.py             # OpenAPI 修复
-│   ├── sync_openapi.py            # OpenAPI 同步
-│   ├── update_openapi.py          # OpenAPI 更新
-│   ├── validate_openapi.py        # OpenAPI 校验
-│   ├── phase4_update_openapi.py   # Phase4 OpenAPI 更新
-│   └── stress_register.py         # 压测账号注册
-├── server/                        # Go 服务端主代码库（详见下文）
-├── tests/                         # 跨仓库测试归档（screenshots/、verification-shots/）
-├── web/                           # 网页前端源码（admin + shared；网页版 voice 已于 2026-09-09 归档，源码存根 `归档数据/`）
-│   ├── admin/                      # 管理后台前端源码（构建产物 → webhost/dist/admin）
-│   ├── shared/                     # 跨端共享代码唯一源（同步 → ridgericetalk-win/src/shared）
-│   ├── docs/                       # 前端文档（CHANGELOG.md 等）
-│   └── tests/                      # 前端测试 / QA 记录
-├── webhost/                       # 前端构建产物托管目录
-│   └── dist/                      # 含 admin/、voice/，由 server 内嵌托管（voice 为归档前最后构建产物，不再重建）
-├── openapi.yaml                   # OpenAPI 接口规范
-├── setup.sh                       # 开发环境初始化脚本
-├── docker-compose.dev.yml         # 开发环境 Docker Compose（生产部署已废弃 Docker 路径）
-├── CONTRIBUTING.md                # 贡献指南
+RiceTalk-Server/
+├── LICENSE                        # AGPL-3.0（自有代码）
+├── THIRD_PARTY_NOTICES.md         # 第三方组件许可清单
+├── README.md                      # 本文件
 ├── SECURITY.md                    # 安全策略
-├── CLAUDE.md                      # Claude Code 快速识别入口
-└── CHANGE.md                      # 变更说明
+├── install.sh                     # 一键引导安装（探测依赖 → 拉取部署脚本）
+├── openapi.yaml                   # OpenAPI 接口规范
+├── .env.example                   # 环境变量样例
+├── livekit/                       # LiveKit Server 二进制与配置模板
+├── migrations/                    # 数据库迁移文件（golang-migrate 格式，up/down 配对）
+├── models/tts/                    # TTS 模型说明与词典（大模型部署时下载）
+├── music-bot-worker/              # Node.js 音乐播放 Worker
+├── services/netease-api/          # NeteaseCloudMusicApi 内嵌服务
+├── server/                        # Go 服务端主代码（详见下文）
+├── web/                           # 网页前端源码（admin 管理后台 + shared 跨端共享源）
+└── webhost/dist/                  # 前端预构建产物（admin 等，服务端内嵌托管）
 ```
 
 ### `server/` 详细结构
@@ -257,17 +242,11 @@ bash server/scripts/deploy-baremetal.sh
 
 ## 变更日志
 
-详见 [docs/CHANGELOG.md](file:///c:/RICETALK/ridgericetalk/docs/CHANGELOG.md)。
 
 ## 相关文档
 
-- 服务端深度文档：[server/README.md](file:///c:/RICETALK/ridgericetalk/server/README.md)（语音协作设计、前端 UI 设计、实体状态机、环境变量）
-- 服务端详细开发文档：`../文档/03-服务端与数据库/服务端详细开发文档.md`
-- 数据库设计：`../文档/03-服务端与数据库/数据库设计详细文档.md`
-- API 规范：`openapi.yaml` 与 `../文档/03-服务端与数据库/openapi.yaml`
-- WebSocket 协议：`../文档/03-服务端与数据库/websocket协议规范.md`
-- 实时通信设计：`../文档/03-服务端与数据库/实时通信专项设计文档.md`
-- 部署文档：`../文档/05-工程规范与运维/`
+- 服务端说明：本仓库 `server/README.md`
+- API 规范：本仓库 `openapi.yaml`
 
 ## License
 
