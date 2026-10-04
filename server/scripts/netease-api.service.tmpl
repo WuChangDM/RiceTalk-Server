@@ -1,0 +1,58 @@
+# NeteaseCloudMusicApi systemd service template
+# Rendered by deploy-baremetal.sh Stage 8
+# Placeholders:
+#   {{EXEC_START}}    — node binary path
+#   {{APP_DIR}}       — netease app directory
+#   {{USER}}          — unprivileged user
+#   {{PORT}}          — listen port (default 3300)
+#
+# After rendering, install with:
+#   sudo cp netease-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now netease-api
+
+[Unit]
+Description=NeteaseCloudMusicApi for RidgeRiceTalk
+After=network-online.target
+Before=ridgericetalk.service
+Wants=network-online.target
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User={{USER}}
+Group={{USER}}
+WorkingDirectory={{APP_DIR}}
+Environment=NODE_ENV=production
+Environment=PORT={{PORT}}
+Environment=HOST=127.0.0.1
+
+ExecStart={{EXEC_START}} app.js
+
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=3
+
+KillSignal=SIGINT
+TimeoutStopSec=15s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{APP_DIR}}
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=netease-api
+
+[Install]
+WantedBy=multi-user.target

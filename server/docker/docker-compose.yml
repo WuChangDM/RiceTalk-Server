@@ -1,0 +1,182 @@
+# RidgeRiceTalk 生产环境 Docker Compose 编排
+#
+# 密钥说明：
+#   - RRT_JWT_SECRET/RRT_CSRF_TOKEN_SECRET/RRT_ENCRYPTION_KEY/RRT_LIVEKIT_API_KEY/
+#     RRT_LIVEKIT_API_SECRET 留空时，后端首次启动会自动生成并持久化到
+#     /app/storage/secrets.json（权限 0600），同时渲染 /app/storage/livekit.yaml
+#   - 老手可显式设置这些环境变量覆盖自动生成逻辑
+#   - 多实例部署必须手动统一密钥（禁用自动生成）
+#   - POSTGRES_PASSWORD 必须提供（Postgres 容器启动要求），首次部署可通过
+#     `openssl rand -hex 16` 生成
+#
+# 用法（仅 Postgres 密码必需，其余密钥可省略以触发自动生成）：
+#   export POSTGRES_PASSWORD=$(openssl rand -hex 16)
+#   # 可选：显式覆盖自动生成的密钥
+#   # export RRT_JWT_SECRET=$(openssl rand -hex 32)
+#   # export RRT_CSRF_TOKEN_SECRET=$(openssl rand -hex 32)
+#   # export RRT_LIVEKIT_API_SECRET=$(openssl rand -hex 32)
+#   # export RRT_ENCRYPTION_KEY=$(openssl rand -hex 32)
+#   docker compose -f server/docker/docker-compose.yml --env-file server/.env.production up -d
+#
+# 持久化：
+#   - ./data 目录挂载到容器 /app/storage，保存 secrets.json、livekit.yaml、server-state.json
+#   - 首次启动后请备份 ./data/secrets.json，丢失会导致已签发的 JWT 失效
+
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: server/docker/Dockerfile
+    container_name: ridgericetalk
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      - RRT_ENV=production
+      - RRT_LOG_LEVEL=info
+      - RRT_PORT=8080
+      - RRT_ADMIN_PORT=9090
+      - RRT_DATABASE_URL=postgres://ridgericetalk:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/ridgericetalk?sslmode=require
+      - RRT_DB_DRIVER=postgres
+      - RRT_DB_PASSWORD=${RRT_DB_PASSWORD:-${POSTGRES_PASSWORD}}
+      # 下列密钥留空时，后端首次启动自动生成并持久化到 /app/storage/secrets.json
+      - RRT_JWT_SECRET=${RRT_JWT_SECRET:-}
+      - RRT_CSRF_TOKEN_SECRET=${RRT_CSRF_TOKEN_SECRET:-}
+      - RRT_ENCRYPTION_KEY=${RRT_ENCRYPTION_KEY:-}
+      - RRT_LIVEKIT_API_KEY=${RRT_LIVEKIT_API_KEY:-}
+      - RRT_LIVEKIT_API_SECRET=${RRT_LIVEKIT_API_SECRET:-}
+      - RRT_LIVEKIT_URL=ws://livekit:7880
+      - RRT_LIVEKIT_AUTOSTART=false
+      - RRT_STORAGE_TYPE=local
+      - RRT_LOCAL_DATA_PATH=/app/storage
+      - RRT_ALLOW_REGISTER=true
+      - RRT_MAX_USERS=1000
+    volumes:
+      # 绑定挂载：持久化 secrets.json、livekit.yaml、server-state.json 到宿主机 ./data/
+      - ./data:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # 注意：app 不依赖 livekit 容器启动（livekit 反向依赖 app 渲染的 livekit.yaml）
+      # app 的 livekitmgr 有指数退避重试逻辑，会在 livekit 就绪后自动连接
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          memory: 256M
+    networks:
+      - ridgericetalk
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ridgericetalk-postgres
+    environment:
+      POSTGRES_USER: ridgericetalk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ridgericetalk
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ridgericetalk -d ridgericetalk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          memory: 128M
+    networks:
+      - ridgericetalk
+
+  livekit:
+    image: livekit/livekit-server:v1.8.2
+    container_name: ridgericetalk-livekit
+    # LiveKit 使用后端渲染的 livekit.yaml 配置文件启动（与后端 API 密钥自动同步）
+    # 后端首次启动时会把渲染结果写入 /app/storage/livekit.yaml（宿主机 ./data/livekit.yaml）
+    # entrypoint 等待配置文件生成后启动，最多等待 60 秒
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "等待后端渲染 livekit.yaml（最多 60 秒）..."
+        for i in $$(seq 1 60); do
+          if [ -f /app/storage/livekit.yaml ]; then
+            echo "检测到 livekit.yaml，启动 LiveKit Server"
+            exec livekit-server --config /app/storage/livekit.yaml --bind 0.0.0.0 --port 7880
+          fi
+          sleep 1
+        done
+        echo "等待超时：livekit.yaml 未生成。请检查后端容器日志。"
+        echo "fallback：使用环境变量密钥启动（需显式设置 RRT_LIVEKIT_API_KEY/RRT_LIVEKIT_API_SECRET）"
+        exec livekit-server --bind 0.0.0.0 --port 7880 --api-key $${RRT_LIVEKIT_API_KEY:-devkey} --api-secret $${RRT_LIVEKIT_API_SECRET:-secret}
+    environment:
+      - RRT_LIVEKIT_API_KEY=${RRT_LIVEKIT_API_KEY:-}
+      - RRT_LIVEKIT_API_SECRET=${RRT_LIVEKIT_API_SECRET:-}
+    ports:
+      - "7880:7880"
+      - "7881:7881/udp"
+    volumes:
+      # 只读挂载：读取后端渲染的 livekit.yaml
+      - ./data:/app/storage:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7880"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          memory: 128M
+    networks:
+      - ridgericetalk
+
+  # 网易云音乐 API（音乐机器人依赖）
+  # 注意：binaryify/neteasecloudmusicapi 官方只有 latest 标签，存在供应链风险。
+  # 生产环境建议自行构建/固定镜像 digest，或在内网部署。
+  netease-api:
+    image: binaryify/neteasecloudmusicapi:latest
+    container_name: ridgericetalk-netease
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3000
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    networks:
+      - ridgericetalk
+
+volumes:
+  postgres-data:
+
+networks:
+  ridgericetalk:
+    driver: bridge

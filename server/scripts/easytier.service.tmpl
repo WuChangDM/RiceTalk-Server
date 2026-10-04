@@ -1,0 +1,44 @@
+[Unit]
+Description=EasyTier Virtual Network Service (RidgeRiceTalk)
+Documentation=https://github.com/EasyTier/EasyTier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{SERVICE_USER}}
+Group={{SERVICE_USER}}
+
+# EasyTier 启动命令（DES-2026-0731-02）：
+# 服务器作为纯转发/中继节点，不分配虚拟 IP，不创建 TUN 设备。
+# 客户端通过 -p udp://<public-ip>:{{EASYTIER_PORT}} 连接到此服务器。
+#
+# --network-name: 固定为 ridgericetalk（所有 Space 共享）
+# --network-secret: 部署时生成的网络密钥（从 /etc/easytier/secret 读取）
+# --hostname: 节点名称（服务器节点）
+# --mtu: 1380（适配大多数 NAT 环境）
+# -l: 监听协议 udp://0.0.0.0:{{EASYTIER_PORT}}
+# --rpc-portal: RPC 管理 API（127.0.0.1:11210，供 easytier-cli 和健康检查使用）
+ExecStart={{EASYTIER_BIN}} \
+    --network-name ridgericetalk \
+    --network-secret {{EASYTIER_SECRET}} \
+    --hostname rrt-server \
+    --mtu 1380 \
+    -l udp://0.0.0.0:{{EASYTIER_PORT}} \
+    --rpc-portal 127.0.0.1:11210
+
+Restart=on-failure
+RestartSec=5s
+
+# 安全沙箱（与 ridgericetalk.service 对齐）
+# 注意：不使用 ProtectSystem=strict，因为 EasyTier 需要访问 /etc/easytier/secret
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/easytier /etc/easytier
+
+# 资源限制
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

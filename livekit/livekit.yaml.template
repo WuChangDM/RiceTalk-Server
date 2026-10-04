@@ -1,0 +1,30 @@
+# LiveKit Server 配置模板
+# 此文件由后端首次启动时自动渲染为 livekit.yaml
+# 占位符说明：
+#   {{LIVEKIT_API_KEY}}     - LiveKit API Key（自动生成）
+#   {{LIVEKIT_API_SECRET}}  - LiveKit API Secret（自动生成，与后端 RRT_LIVEKIT_API_SECRET 一致）
+#   {{NODE_IP}}             - 节点 IP（自动检测公网 IP，失败回退本机 IP）
+#   {{WS_PORT}}             - WebSocket 信令端口（默认 7880）
+#   {{UDP_PORT}}            - UDP 媒体端口（默认 7882，单端口多路复用）
+#   {{TCP_PORT}}            - TCP fallback 端口（默认 7881）
+#   {{PROM_PORT}}           - Prometheus 监控端口（默认 9090）
+# 手动修改 livekit.yaml 后不会被覆盖（后端检测到文件存在则跳过渲染）
+port: {{WS_PORT}}
+prometheus_port: {{PROM_PORT}}
+log_level: debug
+logging:
+  json: false
+keys:
+  {{LIVEKIT_API_KEY}}: {{LIVEKIT_API_SECRET}}
+rtc:
+  node_ip: {{NODE_IP}}     # 节点 IP（自动检测公网 IP，失败回退本机 IP）
+  udp_port: {{UDP_PORT}}   # 单端口多路复用（所有媒体流量）
+  tcp_port: {{TCP_PORT}}   # TCP fallback
+  use_external_ip: true    # 自动检测公网 IP（STUN）
+  use_ice_lite: true       # ICE Lite 加速连接
+room:
+  enabled_codecs:
+    - mime: audio/opus
+    - mime: video/vp9
+    - mime: video/vp8
+    - mime: video/h264

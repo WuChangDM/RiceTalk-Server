@@ -1,0 +1,11 @@
+{
+  "bootstrapToken": "REPLACE_WITH_YOUR_BOOTSTRAP_TOKEN",
+  "email": "owner@example.com",
+  "username": "Owner",
+  "displayName": "Owner",
+  "password": "Admin@2026!!Secure",
+  "securityQuestions": [
+    {"question": "您出生城市是哪里？", "answer": "北京"}
+  ],
+  "spaceName": "RidgeRiceTalk"
+}

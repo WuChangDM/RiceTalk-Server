@@ -1,0 +1,123 @@
+# Compiled binaries (root level)
+/ridgericetalk
+/ridgericetalk-server
+/ridgericetalk-server-linux
+/ridgericetalk-server-linux-amd64
+/ridgericetalk_new
+/ridge-talk-server
+/browser_test_ridgericetalk
+
+# Compiled binaries (server level)
+server/ridgericetalk
+server/ridgericetalk-dev
+server/ridgericetalk-test
+server/ridgericetalk-server
+server/ridgericetalk-server-linux
+server/ridgericetalk-server-linux-amd64
+server/ridgericetalk-server.exe
+server/ridgericetalk_linux
+server/ridgericetalk_new
+server/server
+server/server.exe
+server/tts-worker
+server/tts-worker.exe
+server/tts-worker.new
+server/migrate
+server/ridge-talk-server
+server/browser_test_ridgericetalk
+server/ridgericetalk-migrate
+server/ridgericetalk-linux
+server/ridgericetalk-linux-amd64
+
+# Build output
+build/
+server/build/
+
+# Runtime data — all database files and runtime directories
+*.db
+*.db-*
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.backup
+*.db.bak*
+# 运行时数据目录。必须锚定到仓库根：未锚定的 storage/ 会连带忽略
+# server/internal/storage/*.go（源码），导致该文件从未被版本控制（2026-09-12 修复）
+/storage/
+server/storage/
+server/test.db*
+server/internal/bots/storage/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Frontend build artifacts
+# 注意：webhost/dist/ 是部署必需资源（服务端内嵌托管前端），
+# 必须纳入版本控制，下载后可直接部署。
+# 仅排除 server/webhost/dist/（开发时本地构建的副本，部署脚本会从 webhost/dist/ 复制）
+server/webhost/dist/
+
+# Web frontend (development artifacts)
+node_modules/
+web/*/node_modules/
+web/*/dist/
+web/*/test-results/
+web/*/coverage/
+web/*/*.log
+
+# Web frontend test screenshots (large artifacts, can be regenerated)
+web/tests/dogfood/screenshots/
+web/tests/verification-shots/
+web/voice/tests/browser-qa/screenshots/
+
+# NeteaseCloudMusicApi (source in repo, node_modules excluded)
+services/netease-api/node_modules/
+services/netease-api/.env
+
+# Music Bot Worker (Node.js LiveKit Agents Worker)
+# 源码（src/）与配置（package.json/tsconfig.json/systemd/）纳入版本控制，
+# 排除构建产物 dist/ 与打包文件 worker-src.zip
+music-bot-worker/dist/
+music-bot-worker/worker-src.zip
+
+# Server-side web frontend deployment copy
+# 注意：server/webhost/dist/ 是部署必需资源（服务端内嵌托管前端），
+# 必须纳入版本控制。server/web/ 是运行时部署副本，不纳入版本控制。
+server/web/
+
+# Auto-downloaded third-party binaries and models
+# 注意：预置的 TTS 模型文件需要纳入版本控制，详见 models/tts/vits-melo-tts-zh_en/README.md
+third_party/
+models/*
+!models/tts/
+models/tts/*
+!models/tts/vits-melo-tts-zh_en/
+!models/tts/vits-melo-tts-zh_en/**
+# 排除 int8 量化模型（53MB，部署时单独下载，不纳入版本控制）
+models/tts/vits-melo-tts-zh_en/model.int8.onnx
+
+web/admin.archived-20260629/
+web/shared.archived-20260701/
+web/voice.archived-20260629/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary
+*.tmp
+*.temp

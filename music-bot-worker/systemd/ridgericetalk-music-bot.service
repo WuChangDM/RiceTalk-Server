@@ -1,0 +1,27 @@
+[Unit]
+Description=RidgeRiceTalk Music Bot Worker (Node.js LiveKit Agent)
+After=network.target ridgericetalk.service livekit.service
+Requires=ridgericetalk.service
+
+[Service]
+Type=simple
+User=ridgericetalk
+Group=ridgericetalk
+WorkingDirectory=/opt/ridgericetalk/music-bot-worker
+EnvironmentFile=/opt/ridgericetalk/music-bot-worker/.env
+ExecStart=/usr/bin/node /opt/ridgericetalk/music-bot-worker/dist/index.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# 资源限制
+MemoryMax=512M
+CPUQuota=100%
+
+# 安全限制
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
