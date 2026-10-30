@@ -1,0 +1,80 @@
+# Caddy 反代模板 · 场景 C：外部反代 / 已有网关（自动 HTTPS，最省事）
+#
+# 用途：G-5「三类 TLS 场景」之 C。前两档（A 自签、B ACME）由
+#       `deploy-baremetal.sh --tls` 自动完成；本档面向**已有 Caddy / Traefik /
+#       云负载均衡 / 公司网关**的环境：服务器上不跑 Nginx、不动 80/443，
+#       由外部反代终结 TLS 后转发到本机端口。
+#
+# 占位符：
+#   __DOMAIN__      对外域名（Caddy 自动申请 Let's Encrypt 证书，需 80/443 可达）
+#   __API_PORT__    API 监听端口（默认 8080）
+#   __ADMIN_PORT__  Admin 监听端口（默认 9090）
+#   __LK_WS_PORT__  LiveKit WebSocket 端口（默认 7880；媒体端口 7881/7882 是 UDP/TCP
+#                   直连，反代一律不接管 —— 必须由安全组/路由器直接映射）
+#
+# 使用：
+#   sudo cp caddy-tls.conf.tmpl /etc/caddy/Caddyfile     # 替换占位符后
+#   sudo systemctl reload caddy
+#
+# 与部署脚本的配合（关键，否则 CORS / LiveKit 仍指向内网）：
+#   sudo ./deploy-baremetal.sh \
+#     --public-address https://__DOMAIN__ \
+#     --public-lk-url  wss://__DOMAIN__/rtc \
+#     --nat                        # NAT/端口映射清单（外部 80/443 → 本机反代）
+#   注意：TLS 由外部反代终结时**不要**给 --tls（否则本机再起 Nginx 抢 80/443）。
+
+{
+	# 可选：Let's Encrypt 通知邮箱（不写则用 ZeroSSL/Let's Encrypt 默认流程）
+	# email ops@example.com
+	admin off
+}
+
+# ---- 主应用：API + WebSocket + 静态前端 ----
+https://__DOMAIN__ {
+	encode zstd gzip
+	# 附件/语音样本上传
+	request_body {
+		max_size 200MB
+	}
+
+	# Admin 管理后台（独立进程/端口）
+	handle_path /admin/* {
+		reverse_proxy 127.0.0.1:__ADMIN_PORT__
+	}
+	handle_path /api/admin/* {
+		reverse_proxy 127.0.0.1:__ADMIN_PORT__
+	}
+
+	# LiveKit WS 信令（Caddy 自动处理 Upgrade，无需手写 header）
+	handle_path /rtc/* {
+		reverse_proxy 127.0.0.1:__LK_WS_PORT__
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:__API_PORT__
+	}
+
+	# 安全响应头（按需裁剪）
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+}
+
+# ---- 可选：Admin 独立域名（若希望后台与主应用不同域）----
+# https://admin.__DOMAIN__ {
+# 	reverse_proxy 127.0.0.1:__ADMIN_PORT__
+# }
+# 此时部署参数：--public-admin-address https://admin.__DOMAIN__
+#
+# 排障清单：
+#   1) caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+#   2) curl https://__DOMAIN__/api/health → ok
+#   3) 语音不通先看 .env.production：
+#      - RRT_PUBLIC_ADDRESS 是否 https://__DOMAIN__（否则 CORS 403）
+#      - RRT_LIVEKIT_PUBLIC_URL 是否 wss://__DOMAIN__/rtc 或 wss://__DOMAIN__:7880
+#      - RRT_LIVEKIT_USE_EXTERNAL_IP：外部反代后本机仍可能有公网地址，可保持 true；
+#        纯 NAT（本机无公网 IP）必须 false（--nat 已强制）
+#   4) 媒体端口 7880/tcp（WS）、7881/tcp、7882/udp 必须在云安全组放通；
+#      反代只接管 WS 信令，媒体流是直连，**不能**经 Caddy。

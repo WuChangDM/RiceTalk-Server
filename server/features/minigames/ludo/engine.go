@@ -55,6 +55,11 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 
 	switch action {
 	case "roll_dice":
+		// 掷出后必须先走子（move_pawn）才能再次掷骰，
+		// 否则玩家可反复掷骰直到掷出 6 再起飞（作弊）。
+		if rolled, _ := state["rolled"].(bool); rolled {
+			return nil, util.ErrInvalidAction
+		}
 		roll := e.rollDie()
 		newState := util.ShallowCopy(state)
 		newState["lastRoll"] = roll
@@ -81,7 +86,9 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 				roll = int(n)
 			}
 		}
-		var p struct{ PawnIndex int `json:"pawnIndex"` }
+		var p struct {
+			PawnIndex int `json:"pawnIndex"`
+		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, util.ErrInvalidAction
 		}

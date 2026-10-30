@@ -118,6 +118,15 @@ PORT_LK_WS=7880
 PORT_LK_TCP=7881
 PORT_LK_UDP=7882
 PUBLIC_IP=""
+# G-5（网络适配收口）：对外地址 / Admin 对外地址 / LiveKit 对外 WS URL / NAT 模式。
+# 全部默认空 / false —— 不传这些参数时生成的 .env 与改动前逐字节一致（可回滚）。
+PUBLIC_ADDRESS_ARG=""
+PUBLIC_ADMIN_ADDRESS_ARG=""
+PUBLIC_LK_URL_ARG=""
+NAT_MODE=false
+# G-5：是否把 --http-proxy/--https-proxy 同时注入系统包管理器（默认 false，
+# 绝不默认改系统配置；系统软件源切换仍不做，属 G-5b 边界）。
+SYSTEM_PROXY=false
 REPO_URL=""
 REPO_BRANCH="main"
 WITH_MONITORING=false
@@ -196,6 +205,7 @@ Options:
                           构建批次记录（.rrt-commit，说明现行二进制由别处的归档构建而来）时，
                           打印告警并**拒绝继续**，避免用旧源码静默覆盖运行中的二进制（H17）。
                           仅在你已人工核对「这棵树就是本次要发布的源码」时才指定本开关。
+  --assets-dir <dir>      G-7 离线资产目录（LiveKit/TTS模型/EasyTier 同名文件本地优先，无则回退网络）
   --mirror-preset <mode>  下载镜像预设（默认 auto，G-5）：
                           auto   保持既有回退顺序（Go/Node 国内优先、GitHub/npm 直连优先）；
                           cn     国内镜像优先（GitHub 加速前缀前置、npm 直接用 npmmirror）；
@@ -217,6 +227,22 @@ Options:
                           livekit.yaml 写入 turn 块（udp 3478）；证书就绪时另写
                           tls_port 5349。需防火墙/安全组放行 3478/udp（及 5349/tcp）。
   --public-ip <ip>        公网 IP（默认自动检测）
+  --public-address <url>  G-5：对外访问基址（完整 URL，如 http://203.0.113.10:50100、
+                          https://voice.example.com）。NAT 外部端口 ≠ 监听端口、
+                          域名 + 反代、IPv6 场景必须显式给出；缺省仍按
+                          http://<公网IP>:<PORT_API> 推导（旧行为逐字节不变）。
+  --public-admin-address <url> G-5：Admin 对外基址（默认由 --public-address 换
+                          --port-admin 推导；NAT 下 Admin 外部端口不同才需要）。
+  --public-lk-url <ws-url> G-5：LiveKit 对外 WebSocket URL（如
+                          wss://voice.example.com/livekit 或 ws://203.0.113.10:50101）。
+                          默认按对外地址 host + --port-lk-ws 推导。
+  --nat                   G-5：NAT / 端口映射模式。必须给 --public-ip（跳过自动探测），
+                          强制 use_external_ip=false，并打印端口映射清单。
+                          注意 LiveKit 媒体端口 7881/7882 服务端固定 → 必须 1:1 映射。
+  --system-proxy          G-5：把代理同时注入系统包管理器（apt:
+                          /etc/apt/apt.conf.d/99rrt-proxy；dnf: /etc/dnf/dnf.conf 的
+                          proxy=）。默认关闭，仅 --http-proxy/--https-proxy 生效；
+                          **不修改系统软件源**（系统源切换属 G-5b）。
   --repo-url <url>        自动 git clone 源码到 /opt/ridgericetalk（若不存在）
   --repo-branch <name>    克隆时使用的分支（默认 main）
   --with-monitoring       安装 Netdata 系统监控（可选，默认不启用）
@@ -293,6 +319,7 @@ while [[ $# -gt 0 ]]; do
             esac
             shift 2 ;;
         --rebuild-admin) REBUILD_ADMIN=true; shift ;;
+        --assets-dir)    OFFLINE_ASSETS_DIR="$2"; shift 2 ;;  # G-7：离线资产目录（LiveKit/TTS模型/EasyTier 本地优先）
         --dry-run)       DRY_RUN=true; shift ;;
         --port-api)      PORT_API="$2"; shift 2 ;;
         --port-admin)    PORT_ADMIN="$2"; shift 2 ;;
@@ -301,6 +328,11 @@ while [[ $# -gt 0 ]]; do
         --port-lk-udp)   PORT_LK_UDP="$2"; shift 2 ;;
         --enable-turn)   ENABLE_TURN=true; shift ;;
         --public-ip)     PUBLIC_IP="$2"; shift 2 ;;
+        --public-address)       PUBLIC_ADDRESS_ARG="$2"; shift 2 ;;
+        --public-admin-address) PUBLIC_ADMIN_ADDRESS_ARG="$2"; shift 2 ;;
+        --public-lk-url)        PUBLIC_LK_URL_ARG="$2"; shift 2 ;;
+        --nat)           NAT_MODE=true; shift ;;
+        --system-proxy)  SYSTEM_PROXY=true; shift ;;
         --http-proxy)    HTTP_PROXY_ARG="$2"; shift 2 ;;
         --https-proxy)   HTTPS_PROXY_ARG="$2"; shift 2 ;;
         --repo-url)      REPO_URL="$2"; shift 2 ;;
@@ -331,6 +363,24 @@ done
 if [[ "$TLS_MODE" == "acme" && -z "$TLS_DOMAIN" ]]; then
     fail "--tls acme 需要同时指定 --domain <fqdn>（用于 Let's Encrypt 签发证书）"
     info "示例: sudo $SCRIPT_NAME --tls acme --domain voice.example.com"
+    exit 2
+fi
+
+# G-5：对外地址 / NAT 参数合法性收口（纯字符串校验，不依赖能力层）。
+if [[ -n "$PUBLIC_ADDRESS_ARG" && "$PUBLIC_ADDRESS_ARG" != *"://"* ]]; then
+    fail "--public-address 必须带协议前缀（http:// 或 https://）：$PUBLIC_ADDRESS_ARG"
+    exit 2
+fi
+if [[ -n "$PUBLIC_ADMIN_ADDRESS_ARG" && "$PUBLIC_ADMIN_ADDRESS_ARG" != *"://"* ]]; then
+    fail "--public-admin-address 必须带协议前缀（http:// 或 https://）：$PUBLIC_ADMIN_ADDRESS_ARG"
+    exit 2
+fi
+if [[ -n "$PUBLIC_LK_URL_ARG" && "$PUBLIC_LK_URL_ARG" != ws://* && "$PUBLIC_LK_URL_ARG" != wss://* ]]; then
+    fail "--public-lk-url 必须以 ws:// 或 wss:// 开头：$PUBLIC_LK_URL_ARG"
+    exit 2
+fi
+if [[ "$NAT_MODE" == "true" && -z "$PUBLIC_IP" && -z "$PUBLIC_ADDRESS_ARG" ]]; then
+    fail "--nat 需要 --public-ip <公网IP> 或 --public-address <url>（NAT 下自动探测不可靠）"
     exit 2
 fi
 
@@ -377,6 +427,17 @@ for RRT_LIB_NAME in os pkg net mirrors wscheck; do
     source "$RRT_LIB_DIR/${RRT_LIB_NAME}.sh"
 done
 unset RRT_LIB_NAME
+
+# G-5：--system-proxy → 代理注入系统包管理器（apt/dnf 探测依赖能力层，故放在此处）。
+# 失败只告警不中止：受限网络里 apt 可能走内网源/镜像直连成功，中止部署代价过高。
+if [[ "$SYSTEM_PROXY" == "true" ]]; then
+    if declare -F rrt_apply_system_proxy &>/dev/null; then
+        RRT_DRY_RUN="$DRY_RUN" rrt_apply_system_proxy "${HTTP_PROXY_ARG:-}" "${HTTPS_PROXY_ARG:-}" \
+            || warn "系统包管理器代理注入失败（已忽略，继续部署；可手动配置 apt/dnf 代理）"
+    else
+        warn "能力层缺少 rrt_apply_system_proxy，跳过系统代理注入"
+    fi
+fi
 
 # 提前计算目标架构，供 Stage 2 的 Go/Node 下载与 Stage 3 LiveKit 等场景使用。
 # D2 收口：架构探测统一用 uname -m，**不得在发行版闸门之前依赖 dpkg** ——
@@ -1381,7 +1442,9 @@ OS_ID="$(rrt_os_id)"
 #     —— 均有 apt，能力层 apt 后端直接可用；
 #   - RHEL 系：Rocky/AlmaLinux/CentOS/Fedora/RHEL/OL —— 走 dnf 抽象
 #     （lib/pkg.sh 包名映射表，无 dnf 的老版本回退 yum）。
-# Alpine 及其它未知发行版仍拒绝（D2 决策 ①：本次只覆盖 Debian 系衍生 + RHEL 系）。
+# G-4：Alpine 放行（apk 抽象后端；⚠️ 已知限制：sherpa-onnx 为 glibc 专有，
+# Alpine(musl) 上 TTS 语音不可用——部署继续，TTS 功能降级并在摘要中明示）。
+# 其它未知发行版仍拒绝（D2 决策 ①：Debian 系衍生 + RHEL 系 + Alpine）。
 case "$OS_ID" in
     debian|ubuntu|deepin|uos|kylin|linuxmint|pop|kali|raspbian)
         ok "操作系统（Debian 系）: ${PRETTY_NAME:-$OS_ID}"
@@ -1391,11 +1454,16 @@ case "$OS_ID" in
         ok "操作系统（RHEL 系）: ${PRETTY_NAME:-$OS_ID}"
         rrt_gate_version_guard || exit 1
         ;;
+    alpine)
+        ok "操作系统（Alpine/musl，G-4）: ${PRETTY_NAME:-$OS_ID}"
+        warn "Alpine 已知限制：sherpa-onnx 为 glibc 专有，TTS 语音在本平台不可用（其余功能不受影响）"
+        RRT_MUSL_PLATFORM=true
+        ;;
     *)
         fail "不支持的发行版: ${PRETTY_NAME:-$OS_ID} (ID=$OS_ID${ID_LIKE:+, ID_LIKE=$ID_LIKE})"
         info "当前支持: Debian 11+/Ubuntu 20.04+ 及 Debian 系衍生（Deepin/UOS/麒麟/Mint/Pop/Kali/Raspbian）"
         info "          RHEL 系（Rocky 9+/AlmaLinux/CentOS Stream 9+/Fedora/RHEL/OL）"
-        info "Alpine 等其它发行版的支持见 DES-2026-0912-03 后续批次"
+        info "          Alpine 3.18+（musl；TTS 语音不可用——G-4 已知限制）"
         exit 1
         ;;
 esac
@@ -1969,6 +2037,21 @@ if run_stage 3; then
         info "未找到内置二进制: $LOCAL_LK_BIN"
     fi
 
+    # G-7：离线资产层——--assets-dir 提供同名文件时直接安装，不打网络
+    if [[ "$SKIP_DOWNLOAD" == "false" && -n "${OFFLINE_ASSETS_DIR:-}" && -f "$OFFLINE_ASSETS_DIR/livekit-server-linux-${LK_ARCH}" ]]; then
+        info "G-7: 使用离线资产 LiveKit: $OFFLINE_ASSETS_DIR/livekit-server-linux-${LK_ARCH}"
+        LK_DL_TMP="${LK_BIN_TARGET}.download.$$"
+        cp "$OFFLINE_ASSETS_DIR/livekit-server-linux-${LK_ARCH}" "$LK_DL_TMP"
+        if install_livekit_binary_atomic "$LK_DL_TMP"; then
+            SKIP_DOWNLOAD=true
+            rm -f -- "$LK_DL_TMP" 2>/dev/null || true
+            ok "LiveKit Server 离线资产安装完成"
+        else
+            rm -f -- "$LK_DL_TMP" 2>/dev/null || true
+            warn "离线资产校验/替换失败，回退网络下载"
+        fi
+    fi
+
     # 降级：网络下载（保留原镜像逻辑，仅在本地不存在/版本不匹配时执行）
     if [[ "$SKIP_DOWNLOAD" == "false" ]]; then
         LK_BASE_URL="https://github.com/livekit/livekit/releases/download/${LIVEKIT_VERSION}/livekit-server-linux-${LK_ARCH}"
@@ -2537,6 +2620,11 @@ if run_stage 6; then
     # 候选 → ICE 全挂、语音全断。规则：私网/本机地址（RFC1918/localhost）→ false；
     # 公网/域名 → true（与旧硬编码一致，公网场景生成物逐字节不变）。
     LK_USE_EXTERNAL_IP="true"
+    if [[ "$NAT_MODE" == "true" ]]; then
+        # NAT 后本机网卡上没有公网地址，STUN 探测只会失败或产出不可达候选。
+        LK_USE_EXTERNAL_IP="false"
+        info "--nat 模式：本机位于 NAT 之后，接口无公网地址 → use_external_ip=false"
+    fi
     if declare -F rrt_is_private_host &>/dev/null && rrt_is_private_host "$PUBLIC_IP"; then
         LK_USE_EXTERNAL_IP="false"
         info "对外地址 $PUBLIC_IP 为私网/本机 → use_external_ip=false（避免 STUN 产出不可达候选，NJ-11）"
@@ -2555,20 +2643,59 @@ if run_stage 6; then
         fi
         info "生成 $ENV_FILE..."
         mkdir -p "$SERVER_DIR"
-        # RRT_PUBLIC_ADDRESS：未显式设置时使用本机主 IP 作为默认值，
-        # 让新机器一键部署后 Web/Admin 端就自动被 CORS 白名单放行。
-        RRT_PUBLIC_ADDRESS="${RRT_PUBLIC_ADDRESS:-http://${PUBLIC_IP}:$PORT_API}"
+        # G-5：对外地址参数化。**不给任何 G-5 参数时三者与改动前逐字节一致**：
+        #   RRT_PUBLIC_ADDRESS     = http://<公网IP>:<PORT_API>
+        #   RRT_CORS_ORIGINS       = 旧四段（IP 双端口 + localhost 双端口）
+        #   RRT_LIVEKIT_PUBLIC_URL = ws://<公网IP>:<PORT_LK_WS>
+        # 给出 --public-address / --public-admin-address / --public-lk-url 后才走显式
+        # 值，从而支持「NAT 外部端口 ≠ 监听端口」「域名 + HTTPS 反代」「IPv6 方括号」。
+        if [[ -n "$PUBLIC_ADDRESS_ARG" ]]; then
+            RRT_PUBLIC_ADDRESS="$PUBLIC_ADDRESS_ARG"
+        else
+            RRT_PUBLIC_ADDRESS="${RRT_PUBLIC_ADDRESS:-http://${PUBLIC_IP}:$PORT_API}"
+        fi
         # N27：CORS 白名单协议必须由实际对外地址推导（useHttps + 实际端口），
         # 禁止硬编码协议 —— fix3 批次曾把白名单写成 https-only，HTTP 部署下
         # 桌面端 origin-rewrite 的 http://<ip>:<port> 全被 403（N27 实测）。
-        # 显式传入 https:// 形态的 RRT_PUBLIC_ADDRESS（或本次带 --tls）时，
-        # 白名单同步用 https；默认（http 地址、无 TLS）推导结果与旧硬编码一致。
         CORS_SCHEME="http"
         case "$RRT_PUBLIC_ADDRESS" in
             https://*|wss://*) CORS_SCHEME="https" ;;
         esac
         if [[ "$TLS_MODE" != "none" ]]; then
             CORS_SCHEME="https"
+        fi
+        # G-5：Admin 对外基址（默认 = 主地址 host + --port-admin；IPv6 自动加方括号）
+        if [[ -n "$PUBLIC_ADMIN_ADDRESS_ARG" ]]; then
+            RRT_ADMIN_PUBLIC_ADDRESS="$PUBLIC_ADMIN_ADDRESS_ARG"
+        else
+            RRT_ADMIN_PUBLIC_ADDRESS="${CORS_SCHEME}://$(rrt_url_host "$(rrt_host_of_address "$RRT_PUBLIC_ADDRESS")"):$PORT_ADMIN"
+        fi
+        # G-5：LiveKit 对外 WS URL（--public-lk-url 优先；否则对外地址 host + WS 端口）
+        if [[ -n "$PUBLIC_LK_URL_ARG" ]]; then
+            RRT_LIVEKIT_PUBLIC_URL="$PUBLIC_LK_URL_ARG"
+        else
+            LK_PUBLIC_SCHEME="ws"
+            [[ "$CORS_SCHEME" == "https" ]] && LK_PUBLIC_SCHEME="wss"
+            RRT_LIVEKIT_PUBLIC_URL="${LK_PUBLIC_SCHEME}://$(rrt_url_host "$(rrt_host_of_address "$RRT_PUBLIC_ADDRESS")"):$PORT_LK_WS"
+        fi
+        # G-5：CORS 白名单。显式对外地址 → 直接用对外 URL（含 NAT 外部端口/域名）；
+        # 未显式 → 保持旧四段（逐字节兼容，含 --tls 时仍按旧口径用 IP 拼）。
+        if [[ -n "$PUBLIC_ADDRESS_ARG" || -n "$PUBLIC_ADMIN_ADDRESS_ARG" ]]; then
+            RRT_CORS_VALUE="${RRT_PUBLIC_ADDRESS},${RRT_ADMIN_PUBLIC_ADDRESS},${CORS_SCHEME}://localhost:$PORT_API,${CORS_SCHEME}://localhost:$PORT_ADMIN"
+        else
+            RRT_CORS_VALUE="${CORS_SCHEME}://${PUBLIC_IP}:$PORT_API,${CORS_SCHEME}://${PUBLIC_IP}:$PORT_ADMIN,${CORS_SCHEME}://localhost:$PORT_API,${CORS_SCHEME}://localhost:$PORT_ADMIN"
+        fi
+        # G-5：NAT / 端口映射清单（仅 --nat 打印，避免污染既有输出）
+        if [[ "$NAT_MODE" == "true" ]]; then
+            NAT_API_PORT="$(rrt_port_of_address "$RRT_PUBLIC_ADDRESS")";   NAT_API_PORT="${NAT_API_PORT:-$PORT_API}"
+            NAT_ADMIN_PORT="$(rrt_port_of_address "$RRT_ADMIN_PUBLIC_ADDRESS")"; NAT_ADMIN_PORT="${NAT_ADMIN_PORT:-$PORT_ADMIN}"
+            NAT_LK_PORT="$(rrt_port_of_address "$RRT_LIVEKIT_PUBLIC_URL")"; NAT_LK_PORT="${NAT_LK_PORT:-$PORT_LK_WS}"
+            info "NAT/端口映射清单（内部端口 → 外部端口，需在路由器/云安全组逐条映射并放通）："
+            printf '    API         %s/tcp → %s/tcp\n' "$PORT_API" "$NAT_API_PORT"
+            printf '    Admin       %s/tcp → %s/tcp\n' "$PORT_ADMIN" "$NAT_ADMIN_PORT"
+            printf '    LiveKit WS  %s/tcp → %s/tcp\n' "$PORT_LK_WS" "$NAT_LK_PORT"
+            printf '    LiveKit TCP %s/tcp → %s/tcp（服务端固定，必须 1:1）\n' "$PORT_LK_TCP" "$PORT_LK_TCP"
+            printf '    LiveKit UDP %s/udp → %s/udp（服务端固定，必须 1:1）\n' "$PORT_LK_UDP" "$PORT_LK_UDP"
         fi
         # N27 说明（置于 heredoc 外：默认路径下生成的 .env 必须与改动前逐字节一致）
         cat > "$ENV_FILE" <<EOF
@@ -2588,10 +2715,10 @@ RRT_PORT=$PORT_API
 RRT_ADMIN_PORT=$PORT_ADMIN
 
 # CORS 白名单：自动放行 Voice、Admin 和 localhost 双端口，确保 Admin 页面可直接访问
-RRT_CORS_ORIGINS=${CORS_SCHEME}://${PUBLIC_IP}:$PORT_API,${CORS_SCHEME}://${PUBLIC_IP}:$PORT_ADMIN,${CORS_SCHEME}://localhost:$PORT_API,${CORS_SCHEME}://localhost:$PORT_ADMIN
+RRT_CORS_ORIGINS=$RRT_CORS_VALUE
 
 # LiveKit 公网地址（前端连接使用）
-RRT_LIVEKIT_PUBLIC_URL=ws://${PUBLIC_IP}:$PORT_LK_WS
+RRT_LIVEKIT_PUBLIC_URL=$RRT_LIVEKIT_PUBLIC_URL
 
 # ============================================================
 # 数据库（PostgreSQL）
@@ -2614,7 +2741,7 @@ RRT_ENCRYPTION_KEY=
 RRT_LIVEKIT_API_KEY=
 RRT_LIVEKIT_API_SECRET=
 RRT_LIVEKIT_URL=ws://localhost:$PORT_LK_WS
-RRT_LIVEKIT_PUBLIC_URL=ws://${PUBLIC_IP}:$PORT_LK_WS
+RRT_LIVEKIT_PUBLIC_URL=$RRT_LIVEKIT_PUBLIC_URL
 RRT_LIVEKIT_AUTOSTART=false
 # 端口配置（供 livekitmgr.generateConfig 读取，避免 livekit.yaml 使用硬编码 7880/7881/7882）
 RRT_LIVEKIT_PORT=$PORT_LK_WS
@@ -3177,7 +3304,23 @@ if run_stage 7; then
             info "修复方式: 在部署源执行 git lfs pull，或手动下载 server/scripts/download-tts-model.sh"
         fi
     else
+        if [[ "${RRT_MUSL_PLATFORM:-}" == "true" ]]; then
+            warn "G-4: Alpine(musl) 平台 sherpa-onnx 不可用，跳过 TTS 模型安装（TTS 功能禁用）"
+            return 0 2>/dev/null || true
+        fi
         warn "未找到预置 TTS 模型文件: $TTS_MODEL_SRC"
+        # G-7：离线资产层——assets 目录提供同名 tar.bz2 时直接解压
+        if [[ -n "${OFFLINE_ASSETS_DIR:-}" && -f "$OFFLINE_ASSETS_DIR/vits-melo-tts-zh_en.tar.bz2" ]]; then
+            info "G-7: 使用离线资产 TTS 模型: $OFFLINE_ASSETS_DIR/vits-melo-tts-zh_en.tar.bz2"
+            tar -xjf "$OFFLINE_ASSETS_DIR/vits-melo-tts-zh_en.tar.bz2" -C "$TTS_MODEL_DIR"
+            chown -R "$SERVICE_USER:$SERVICE_USER" "$TTS_MODEL_PATH" 2>/dev/null || true
+            if tts_model_valid "$TTS_MODEL_PATH"; then
+                ok "TTS 模型离线资产安装完成（校验通过）"
+            else
+                warn "离线 TTS 模型无效，已隔离，TTS 将禁用"
+                tts_model_quarantine "$TTS_MODEL_PATH"
+            fi
+        else
         info "将尝试从网络下载 TTS 模型..."
         TTS_MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-melo-tts-zh_en.tar.bz2"
         TTS_MODEL_TMP=$(mktemp -d)
@@ -3198,6 +3341,7 @@ if run_stage 7; then
             info "手动解压: tar -xjf model.tar.bz2 -C $TTS_MODEL_DIR"
             info "或使用: server/scripts/download-tts-model.sh"
         fi
+        fi  # G-7 else 结束
     fi
     fi
 fi
@@ -3246,6 +3390,12 @@ if run_stage 7; then
         esac
 
         if [[ "${EASYTIER_INSTALL_FAILED:-}" != "true" ]]; then
+            # G-7：离线资产层——assets 目录提供同名 zip 时直接安装
+            if [[ -n "${OFFLINE_ASSETS_DIR:-}" && -f "$OFFLINE_ASSETS_DIR/easytier-linux-${EASYTIER_ARCH}-${EASYTIER_VERSION}.zip" ]]; then
+                info "G-7: 使用离线资产 EasyTier: $OFFLINE_ASSETS_DIR/easytier-linux-${EASYTIER_ARCH}-${EASYTIER_VERSION}.zip"
+                EASYTIER_TMP_DIR=$(mktemp -d)
+                cp "$OFFLINE_ASSETS_DIR/easytier-linux-${EASYTIER_ARCH}-${EASYTIER_VERSION}.zip" "$EASYTIER_TMP_DIR/easytier.zip"
+            else
             EASYTIER_URL="https://github.com/EasyTier/EasyTier/releases/download/${EASYTIER_VERSION}/easytier-linux-${EASYTIER_ARCH}-${EASYTIER_VERSION}.zip"
             EASYTIER_TMP_DIR=$(mktemp -d)
             info "下载 EasyTier: $EASYTIER_URL"
@@ -3291,6 +3441,7 @@ if run_stage 7; then
             fi
 
             rm -rf "$EASYTIER_TMP_DIR"
+            fi  # G-7 else 结束
         fi
     else
         ok "EasyTier 二进制已安装: $EASYTIER_BIN"

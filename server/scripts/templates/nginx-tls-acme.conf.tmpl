@@ -1,0 +1,99 @@
+# Nginx 反代模板 · 场景 B：Let's Encrypt 正式证书（公网域名 + 80/443 公网可达）
+#
+# 用途：G-5「三类 TLS 场景」之 B。`deploy-baremetal.sh --tls acme --domain <fqdn>`
+#       会自动安装 certbot 并签发；本文件供**手工部署 / 证书续期排障 / 二次改造**
+#       时对照（不是运行时必需产物）。
+#
+# 占位符：
+#   __DOMAIN__        公网域名（必须有 A/AAAA 记录指向本机）
+#   __API_PORT__      API 监听端口（默认 8080）
+#   __ADMIN_PORT__    Admin 监听端口（默认 9090）
+#   __LK_WS_PORT__    LiveKit WebSocket 端口（默认 7880）
+#   __LE_DIR__        Let's Encrypt 证书目录（默认 /etc/letsencrypt/live/__DOMAIN__）
+#
+# 首次签发（脚本等价命令）：
+#   sudo certbot --nginx -d __DOMAIN__ --agree-tos -m <邮箱> --redirect
+# 续期：certbot 自带 systemd timer（certbot.timer），验证：sudo certbot renew --dry-run
+#
+# 注意：
+#   - 80 端口必须真实可达（HTTP-01 挑战），CDN/Cloudflare 代理开启时需用 DNS-01 或
+#     临时关闭橙色云；
+#   - 证书路径用 live/ 下的符号链接（certbot 续期后自动指向新文件，勿改成 archive/）。
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name __DOMAIN__;
+
+    ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    # HSTS 建议在确认全站 HTTPS 后再开（含子域用 includeSubDomains 要谨慎）
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    client_max_body_size 200m;
+
+    location /admin/ {
+        proxy_pass http://127.0.0.1:__ADMIN_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/admin/ {
+        proxy_pass http://127.0.0.1:__ADMIN_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /rtc {
+        proxy_pass http://127.0.0.1:__LK_WS_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 86400;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:__API_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+}
+
+# map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+#
+# 部署后核对（G-5 验收口径）：
+#   1) curl https://__DOMAIN__/api/health → ok
+#   2) --public-address https://__DOMAIN__（脚本未给时会推导成 http://<IP>:8080 → CORS 403）
+#   3) LiveKit：RRT_LIVEKIT_PUBLIC_URL 必须 wss://（--tls acme 时脚本自动推导）
+#   4) 若客户端走 /rtc 反代，需同时把 RRT_LIVEKIT_PUBLIC_URL 设为
+#      wss://__DOMAIN__/rtc（LiveKit 的 WS 路径）；直连 7880 则用 wss://__DOMAIN__:7880

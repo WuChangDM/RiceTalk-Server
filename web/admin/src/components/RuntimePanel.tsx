@@ -4,6 +4,7 @@ import type { StorageCategory } from '../types/admin'
 import type { RuntimeStatsSnapshot, AdminAlertInfo } from '../types/admin'
 import { formatBytes, formatBytesFromBytes, formatPercent, formatUptime } from '../utils/format'
 import { exportAdminAuditLogs } from '../../../shared/api-core'
+import RealtimeMetricsCard from './RealtimeMetricsCard'
 
 interface RuntimePanelProps {
   performance: RuntimeStatsSnapshot | null
@@ -223,6 +224,8 @@ export default function RuntimePanel({
               </div>
             </div>
           </div>
+          {/* M2 观测性：实时指标（在线用户/语音房间逐房人数/屏幕共享，5s 轮询） */}
+          <RealtimeMetricsCard />
           <div className="admin-card">
             <h3>累计流量</h3>
             <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-secondary)' }}>

@@ -92,3 +92,17 @@ export interface AdminAlertInfo {
   /** WS 事件附带：open | update | resolved | snapshot | muted */
   action?: string
 }
+
+// M2 观测性：实时房间/在线/屏幕共享指标（GET /api/admin/metrics/realtime）。
+// 字段以服务端 internal/admin/handler_realtime_metrics.go RealtimeMetrics 为准。
+export interface RealtimeRoomStat {
+  roomId: string
+  participantCount: number
+}
+
+export interface RealtimeMetrics {
+  rooms: RealtimeRoomStat[]
+  onlineUsers: number
+  activeScreenshares: number
+  voiceRooms: number
+}

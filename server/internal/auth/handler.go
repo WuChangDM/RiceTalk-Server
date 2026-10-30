@@ -62,8 +62,16 @@ func (h *Handler) RegisterRoutes(r *gin.RouterGroup) {
 	auth := r.Group("/auth")
 	auth.Use(middleware.RateLimit(middleware.AuthRateLimit()))
 	{
-		auth.POST("/register", h.Register)
-		auth.POST("/login", h.Login)
+		// D2 加固：登录/注册是凭据爆破的首要目标，在 auth 组级桶之外再叠一道
+		// 独立实例的每 IP 专用限速（默认 10 次/分钟/IP、突发 5；中间件阶段尚未
+		// 认证，RateLimit 的 key 恒为 ClientIP）。RRT_AUTH_RATE_LIMIT_PER_MIN=0
+		// 时 AuthIPRateLimit 返回 nil —— 不挂专用桶，退回全局桶 + 组级桶。
+		credLimit := gin.HandlerFunc(func(c *gin.Context) { c.Next() })
+		if l := middleware.AuthIPRateLimit(); l != nil {
+			credLimit = middleware.RateLimit(l)
+		}
+		auth.POST("/register", credLimit, h.Register)
+		auth.POST("/login", credLimit, h.Login)
 		auth.POST("/logout", middleware.AuthRequired(h.cfg, h.db), h.Logout)
 		auth.POST("/refresh", h.RefreshToken)
 		auth.GET("/me", middleware.AuthRequired(h.cfg, h.db), h.GetMe)

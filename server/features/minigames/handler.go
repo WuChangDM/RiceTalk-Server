@@ -29,9 +29,10 @@ type GameInfo struct {
 	MinPlayers int    `json:"minPlayers"` // 开局人数下限（0 表示等于 Players）
 	// Category 供客户端分流（设计 §15.3.3）："single" 单机 / "multi" 多人联机。
 	Category string `json:"category"`
-	// ScoreDimension/ScoreOrder 仅单机游戏有排行榜（设计 §15.7.4）：
-	// 维度名（如"最高分"/"最高连胜"/"最短用时(秒)"），方向 "desc"（越大越好）或 "asc"（越小越好）。
-	// ScoreDimension 为空表示该游戏无排行榜（多人联机游戏）。
+	// ScoreDimension/ScoreOrder 排行榜维度（设计 §15.7.4）：
+	// 维度名（如"最高分"/"最高连胜"/"最短用时(秒)"/"胜场数"），方向 "desc"（越大越好）或 "asc"（越小越好）。
+	// 多人棋类填"胜场数"表示由服务端权威结算（客户端不可上报分数，见 score.go）；
+	// ScoreDimension 为空表示该游戏无排行榜（狼人杀/斗地主/日麻）。
 	ScoreDimension string `json:"scoreDimension,omitempty"`
 	ScoreOrder     string `json:"scoreOrder,omitempty"`
 }
@@ -49,18 +50,25 @@ func (g GameInfo) MinPlayersOrDefault() int {
 // 单机条目（Category=single）只作为「列表项 + 排行榜宿主」存在，不注册引擎：
 // 客户端本地实现玩法，服务端只负责排行榜。Join/game_start 的 Online 校验会拒绝其建房。
 var defaultGames = []GameInfo{
-	// —— 多人联机（需要房间，无排行榜）——
-	{ID: "tictactoe", Name: "井字棋", Players: 2, Online: true, Category: "multi"},
-	{ID: "chess", Name: "国际象棋", Players: 2, Online: true, Category: "multi"},
-	{ID: "gobang", Name: "五子棋", Players: 2, Online: true, Category: "multi"},
+	// —— 多人联机 ——
+	// 棋类（可判胜负）走**服务端权威计分**：胜负由服务端结算并累加「胜场数」，
+	// 客户端 POST /minigames/leaderboard 上传的 score 一律忽略（D1，见 score.go）。
+	{ID: "tictactoe", Name: "井字棋", Players: 2, Online: true, Category: "multi", ScoreDimension: "胜场数", ScoreOrder: "desc"},
+	{ID: "chess", Name: "国际象棋", Players: 2, Online: true, Category: "multi", ScoreDimension: "胜场数", ScoreOrder: "desc"},
+	{ID: "xiangqi", Name: "中国象棋", Players: 2, Online: true, Category: "multi", ScoreDimension: "胜场数", ScoreOrder: "desc"},
+	{ID: "gobang", Name: "五子棋", Players: 2, Online: true, Category: "multi", ScoreDimension: "胜场数", ScoreOrder: "desc"},
+	// 狼人杀/斗地主/日麻：胜负由引擎结算，但没有「胜场数」排行榜（保持无排行榜）。
 	{ID: "werewolf", Name: "狼人杀", Players: 6, Online: true, Category: "multi"},
-	// 飞行棋支持 2-4 人（设计 §15.7.5.1）
-	{ID: "ludo", Name: "飞行棋", Players: 4, MinPlayers: 2, Online: true, Category: "multi"},
+	// 飞行棋支持 2-4 人（设计 §15.7.5.1）；胜负同样服务端权威计分。
+	{ID: "ludo", Name: "飞行棋", Players: 4, MinPlayers: 2, Online: true, Category: "multi", ScoreDimension: "胜场数", ScoreOrder: "desc"},
 	{ID: "doudizhu", Name: "斗地主", Players: 3, Online: true, Category: "multi"},
+	// 日本麻将：4 人固定座次，规则内核见 features/minigames/riichi/core
+	{ID: "riichi", Name: "日本麻将", Players: 4, Online: true, Category: "multi"},
 	// —— 单机（无需房间，每个游戏各有排行榜）——
 	{ID: "2048", Name: "2048", Players: 1, LocalOnly: true, Category: "single", ScoreDimension: "最高分", ScoreOrder: "desc"},
 	{ID: "tictactoe-local", Name: "井字棋（单机）", Players: 1, LocalOnly: true, Category: "single", ScoreDimension: "最高连胜", ScoreOrder: "desc"},
 	{ID: "chess-local", Name: "国际象棋（单机）", Players: 1, LocalOnly: true, Category: "single", ScoreDimension: "最短用时(秒)", ScoreOrder: "asc"},
+	{ID: "xiangqi-local", Name: "中国象棋（单机）", Players: 1, LocalOnly: true, Category: "single", ScoreDimension: "最短用时(秒)", ScoreOrder: "asc"},
 }
 
 // L21: 游戏注册表（线程安全，支持运行时动态注册）
@@ -503,9 +511,42 @@ func (h *Handler) Leave(c *gin.Context) {
 
 	// Host leaving or last player leaving marks session inactive/ended.
 	players := parsePlayers(session.PlayersJSON)
+
+	// D3：1v1 对局中一方显式离开 → 对手立即判胜（结算 + 写历史），
+	// 不再落入「房主离开直接结束（无胜负、无历史）」或「剩 1 人空等到 2h 回收」。
+	if wasPlayer && session.Status == "playing" && is1v1Game(session.GameType) && len(players) == 1 {
+		if winner, _ := players[0]["userId"].(string); winner != "" {
+			if h.forfeit1v1(&session, winner, userID, "opponent_left") {
+				errors.Success(c, gin.H{
+					"message":  "left",
+					"winnerId": winner,
+					"reason":   "opponent_left",
+				})
+				return
+			}
+		}
+	}
 	if session.HostID == userID || (wasPlayer && len(players) == 0) {
 		session.IsActive = false
 		session.Status = "ended"
+	}
+	// 若离开的玩家正轮到其行动，把回合交给仍在座的玩家，
+	// 否则 currentPlayer 指向已离开的人，整局永久卡死（只能靠房主重开）。
+	if session.Status == "playing" && wasPlayer && len(players) > 0 {
+		state := parseState(session.State)
+		if cur, _ := state["currentPlayer"].(string); cur == userID {
+			remaining := make([]string, 0, len(players))
+			for _, p := range players {
+				if uid, ok := p["userId"].(string); ok && uid != "" {
+					remaining = append(remaining, uid)
+				}
+			}
+			if len(remaining) > 0 {
+				state["currentPlayer"] = remaining[0]
+				state["rolled"] = false
+				session.State = marshalState(state)
+			}
+		}
 	}
 	session.UpdatedAt = time.Now().UTC()
 	if err := h.db.Save(&session).Error; err != nil {
@@ -525,6 +566,34 @@ func (h *Handler) Leave(c *gin.Context) {
 	})
 
 	errors.Success(c, gin.H{"message": "left"})
+}
+
+// errSessionStateConflict 用于乐观锁冲突：两次动作基于同一份旧状态并发提交。
+// 语义上等价于「该动作在过期局面上已被拒绝」，客户端重新拉取 GetState 后可重试。
+var errSessionStateConflict = errors.New(errors.MINIGAME_INVALID_ACTION, "对局状态已被其他动作更新，请刷新后重试")
+
+// persistSessionState 以 state 文本作乐观锁写入 state/status。
+// 只更新这三列（不整行 Save）：① 并发动作不会互相覆盖导致落子丢失/回滚；
+// ② 不会用陈旧的 PlayersJSON/SpectatorsJSON 覆盖并发 Join/Leave 的写入。
+// 比较 state 而非 updated_at：sqlite/pg 的时间列精度不同（sqlite 常被截到秒），
+// 同一秒内的两次写入用时间作锁会漏判；state 是原文读回、逐字节可比。
+func (h *Handler) persistSessionState(session *model.MinigameSession, prevState string) error {
+	now := time.Now().UTC()
+	res := h.db.Model(&model.MinigameSession{}).
+		Where("id = ? AND state = ?", session.ID, prevState).
+		Updates(map[string]interface{}{
+			"state":      session.State,
+			"status":     session.Status,
+			"updated_at": now,
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errSessionStateConflict
+	}
+	session.UpdatedAt = now
+	return nil
 }
 
 // Action records a game action and updates session state.
@@ -553,6 +622,8 @@ func (h *Handler) Action(c *gin.Context) {
 		errors.JSONError(c, errors.ErrInternal)
 		return
 	}
+	// 乐观锁基线：后续写入要求 state 未被其他动作改动。
+	prevState := session.State
 
 	if !h.checkSpaceMembership(session.SpaceID, userID) {
 		errors.JSONError(c, errors.ErrForbidden)
@@ -686,18 +757,24 @@ func (h *Handler) Action(c *gin.Context) {
 	})
 	state["actions"] = actions
 
+	// D3：刷新本人在场心跳（1v1 断线判负依赖它；节流 15s，避免每次动作都写大 state）。
+	_ = touchPresence(state, userID, time.Now().UTC())
+
 	stateJSON, _ := json.Marshal(state)
 	session.State = string(stateJSON)
-	session.UpdatedAt = time.Now().UTC()
 
-	if err := h.db.Save(&session).Error; err != nil {
+	if err := h.persistSessionState(&session, prevState); err != nil {
+		if err == errSessionStateConflict {
+			errors.JSONError(c, err)
+			return
+		}
 		errors.JSONError(c, errors.ErrInternal)
 		return
 	}
 
 	// §15.4: 游戏结束时写入历史记录（写入失败不影响主流程）
 	if gameEnded {
-		h.RecordGameEnd(&session, endedWinnerID, endedIsDraw)
+		h.finishGame(&session, endedWinnerID, endedIsDraw)
 	}
 
 	broadcast := map[string]interface{}{
@@ -766,6 +843,18 @@ func (h *Handler) GetState(c *gin.Context) {
 		return
 	}
 
+	// D3：1v1 对局中「拉取状态」即在线心跳；节流 15s，冲突忽略（说明有并发动作已写过）。
+	if session.Status == "playing" && is1v1Game(session.GameType) {
+		state := parseState(session.State)
+		if touchPresence(state, userID, time.Now().UTC()) {
+			prevState := session.State
+			session.State = marshalState(state)
+			if err := h.persistSessionState(&session, prevState); err != nil {
+				session.State = prevState
+			}
+		}
+	}
+
 	// §3.5 惰性超时：拉取状态时触发一次超时托管（实现 TickTimeout 的引擎，如斗地主/狼人杀）。
 	// 若当前阶段/回合超时，引擎自动推进并持久化 + 广播，保证对局推进。
 	if session.Status == "playing" {
@@ -775,13 +864,18 @@ func (h *Handler) GetState(c *gin.Context) {
 			}); ok2 {
 				state := parseState(session.State)
 				if newState, changed := ticker.TickTimeout(state); changed {
+					prevState := session.State
 					session.State = marshalState(newState)
-					session.UpdatedAt = time.Now().UTC()
-					if err := h.db.Save(&session).Error; err == nil {
-						if winnerID, draw := engine.IsGameOver(newState); winnerID != "" || draw {
-							session.Status = "ended"
-							h.db.Save(&session)
-							h.RecordGameEnd(&session, winnerID, draw)
+					endedNow := false
+					winnerID, draw := engine.IsGameOver(newState)
+					if winnerID != "" || draw {
+						session.Status = "ended"
+						endedNow = true
+					}
+					// 乐观锁写入，避免与并发 Action 互相覆盖。
+					if err := h.persistSessionState(&session, prevState); err == nil {
+						if endedNow {
+							h.finishGame(&session, winnerID, draw)
 						}
 						h.broadcastToRoom(session.ID, map[string]interface{}{
 							"gameId":    session.ID,
@@ -798,16 +892,25 @@ func (h *Handler) GetState(c *gin.Context) {
 	players := parsePlayers(session.PlayersJSON)
 	spectators := parseSpectators(session.SpectatorsJSON)
 
-	// §15.7.5.2: 观战者返回脱敏 state（隐藏手牌/角色等私密信息）。
-	// 玩家与房主返回完整 state；棋类等无私密信息的游戏直接返回完整 state。
+	// §15.7.5.2: 非本局玩家一律按「观战者视角」脱敏（隐藏手牌/角色等私密信息）。
+	// M14（task-82）：玩家视角若引擎实现 PlayerStateProvider（日麻），也剥一次 —— state.snapshot
+	// 含牌山 seed 与全部动作，玩家可离线复算四家手牌与摸牌顺序。
+	// M14 补漏（task-87）：判据必须是「是否为本局玩家」，不能是「是否在 SpectatorsJSON 里」——
+	// 否则「只加空间成员、未入座也未观战」的用户会落到玩家分支，日麻引擎在 seat<0 时返回
+	// 未遮蔽的 views，等于把 4 家手牌下发给任意空间成员（一条 curl 即可利用）。
+	isPlayer := isPlayerInSession(players, userID)
 	stateStr := session.State
-	isSpectator := !isPlayerInSession(players, userID) && isSpectatorInSession(spectators, userID)
-	if isSpectator {
+	if !isPlayer {
 		if engine, ok := h.engines.Get(session.GameType); ok {
 			if spec, ok2 := engine.(SpectatorStateProvider); ok2 {
 				masked := spec.SpectatorState(parseState(session.State))
 				stateStr = marshalState(masked)
 			}
+		}
+	} else if engine, ok := h.engines.Get(session.GameType); ok {
+		if player, ok2 := engine.(PlayerStateProvider); ok2 {
+			masked := player.PlayerState(parseState(session.State), userID)
+			stateStr = marshalState(masked)
 		}
 	}
 
@@ -1042,6 +1145,10 @@ func (h *Handler) tickTimedGames() {
 	}
 	for i := range sessions {
 		s := &sessions[i]
+		// D3：1v1 断线超时判负（60s 宽限）。命中即已结算并落库，跳过本会话后续推进。
+		if h.applyDisconnectForfeit(s, time.Now().UTC()) {
+			continue
+		}
 		engine, ok := h.engines.Get(s.GameType)
 		if !ok {
 			continue
@@ -1057,15 +1164,20 @@ func (h *Handler) tickTimedGames() {
 		if !changed {
 			continue
 		}
+		prevState := s.State
 		s.State = marshalState(newState)
-		s.UpdatedAt = time.Now().UTC()
-		if err := h.db.Save(s).Error; err != nil {
+		ended := false
+		winnerID, draw := engine.IsGameOver(newState)
+		if winnerID != "" || draw {
+			s.Status = "ended"
+			ended = true
+		}
+		// 与 Action 相同的乐观锁写入：避免与玩家动作并发时互相覆盖。
+		if err := h.persistSessionState(s, prevState); err != nil {
 			continue
 		}
-		if winnerID, draw := engine.IsGameOver(newState); winnerID != "" || draw {
-			s.Status = "ended"
-			h.db.Save(s)
-			h.RecordGameEnd(s, winnerID, draw)
+		if ended {
+			h.finishGame(s, winnerID, draw)
 		}
 		h.broadcastToRoom(s.ID, map[string]interface{}{
 			"gameId":    s.ID,

@@ -1,0 +1,111 @@
+# Nginx 反代模板 · 场景 A：自签名证书（局域网 / 内网 / 无域名）
+#
+# 用途：G-5「三类 TLS 场景」之 A。`deploy-baremetal.sh --tls selfsigned` 会自动调用
+#       scripts/setup-lan-https.sh 生成本模板对应的配置；本文件供**手工部署 / 排障 /
+#       二次改造**时对照使用（不是运行时必需产物）。
+#
+# 占位符（全部替换后再落到 /etc/nginx/conf.d/ridgericetalk.conf）：
+#   __SERVER_NAME__   证书 server_name（IP 或内网域名，如 192.168.1.10）
+#   __API_PORT__      服务端 API 监听端口（默认 8080）
+#   __ADMIN_PORT__    Admin 监听端口（默认 9090）
+#   __LK_WS_PORT__    LiveKit WebSocket 端口（默认 7880）
+#   __CERT_DIR__      证书目录（默认 /etc/nginx/ssl）
+#
+# 证书生成（任选其一）：
+#   sudo bash scripts/setup-lan-https.sh --domain __SERVER_NAME__
+#   或手工：
+#     openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+#       -keyout __CERT_DIR__/ridgericetalk.key \
+#       -out    __CERT_DIR__/ridgericetalk.crt \
+#       -subj "/CN=__SERVER_NAME__" \
+#       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:__SERVER_NAME__"
+#
+# 客户端信任：把 ridgericetalk.crt 导入系统/浏览器信任库，否则桌面端 E2EE 与
+# 网页端语音（要求安全上下文）会失败。桌面端安装脚本：
+#   scripts/install-cert-windows.ps1
+
+# ---- 80：仅做 301 跳转（保留 ACME 挑战路径给未来切换场景 B 用）----
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __SERVER_NAME__;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ---- 443：API + Admin + LiveKit WS 反代 ----
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name __SERVER_NAME__;
+
+    ssl_certificate     __CERT_DIR__/ridgericetalk.crt;
+    ssl_certificate_key __CERT_DIR__/ridgericetalk.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+
+    # 客户端上传：附件/表情/语音样本，默认 1m 太小
+    client_max_body_size 200m;
+
+    # Admin 管理后台（独立端口，独立进程）
+    location /admin/ {
+        proxy_pass http://127.0.0.1:__ADMIN_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 管理后台的 API 也在 Admin 端口上（/api/admin/*）
+    location /api/admin/ {
+        proxy_pass http://127.0.0.1:__ADMIN_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # LiveKit WebSocket / RTC 信令（路径反代；也可让客户端直连 __LK_WS_PORT__）
+    location /rtc {
+        proxy_pass http://127.0.0.1:__LK_WS_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 86400;
+    }
+
+    # 主应用（API + WS + 静态前端）
+    location / {
+        proxy_pass http://127.0.0.1:__API_PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+    }
+}
+
+# ---- 需要放在 http {} 块内（与 server 同级）----
+# map $http_upgrade $connection_upgrade {
+#     default upgrade;
+#     ''      close;
+# }
+#
+# 部署后核对（G-5 验收口径）：
+#   1) curl -k https://__SERVER_NAME__/api/health     → ok
+#   2) .env.production 中 RRT_PUBLIC_ADDRESS 必须是 https://__SERVER_NAME__
+#      （脚本：--public-address https://__SERVER_NAME__；否则 CORS 白名单仍是 http:// 被 403）
+#   3) RRT_LIVEKIT_PUBLIC_URL 用 wss://（脚本自动按 https 推导；也可 --public-lk-url 显式给）

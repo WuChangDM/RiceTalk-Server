@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-10-30 — admin：初始化/重置密码长度提示与服务端校验错误提示
+
+### fix(admin): 密码长度提示 8→12 位并对齐服务端校验，初始化失败改为可读原因
+
+- **修改类型**：修复
+- **修改位置**：`admin/src/components/LoginForm.tsx`（初始化向导密码 placeholder 与前端校验、bootstrap 失败错误映射）、`admin/src/components/UsersPanel.tsx`（重置密码弹窗标签与校验）
+- **背景（问题）**：服务端 `ValidatePassword` 要求密码 **≥12 位**，但管理端初始化向导与「重置密码」弹窗都只校验 ≥8 位。用户在 t46 真机初始化时按 8 位密码提交，服务端返回 400 `bad request`，界面只显示「初始化失败」，用户表现为「填完点下一步没反应」，排查成本高。
+- **修改内容**：①初始化向导 placeholder/前端校验改为 12 位，错误文案写明「服务端要求，建议字母+数字组合」；②bootstrap 失败时优先解析服务端 `details`，映射 password/email/already initialized/security question 四类可读中文提示，兜底才用 `err.message`；③重置密码弹窗标签与校验同步改 12 位。
+- **验证结果**：`cd web/admin && npm run build` 通过；t46 真机复测：≥12 位密码可正常完成 Owner 初始化（此前 8 位必 400）。
+- **影响/边界**：仅管理端文案与前端预校验，不改服务端校验规则；`web/voice` 已归档未涉及。
+
+## 2026-10-04 — admin：监控页实时指标区块（M2 观测性）
+
+### feat(admin): RuntimePanel 新增「实时指标」卡片（5s 轮询逐房人数/在线/屏幕共享）
+
+- **修改类型**：新增
+- **修改位置**：`admin/src/components/RealtimeMetricsCard.tsx`（新组件）、`admin/src/components/RuntimePanel.tsx`（挂载卡片）、`admin/src/utils/realtimeMetrics.ts`（新：apiGet 封装）、`admin/src/types/admin.ts`（RealtimeMetrics/RealtimeRoomStat 类型）、`admin/src/components/__tests__/RealtimeMetricsCard.test.tsx`（新测试）
+- **背景（问题）**：服务端本日新增 `GET /api/admin/metrics/realtime`（见 ridgericetalk 仓 CHANGELOG 同日条目），admin 监控页需要消费该端点展示「在线用户数、语音房间数与每房人数、进行中屏幕共享数」。
+- **修改内容**：①`RealtimeMetricsCard` 自含 5s 轮询（挂载即拉一次、卸载清定时器、失败保留旧值下一拍重试），在「实时概况」卡片下方渲染三个 stat-box（在线用户/语音房间/屏幕共享）+ 逐房人数 chip 列表（rooms 为空整块隐藏）；②`utils/realtimeMetrics.ts` 直接复用 shared 导出的底层 `apiGet`（带 Bearer/CSRF/401 刷新），**不修改 web/shared**（遵循本次「只改 ridgericetalk 与 web/admin 两处」约束；后续如允许动 shared 可平移为 api-core 导出函数）；③类型登记在 admin 本地 `types/admin.ts`，字段以服务端 `handler_realtime_metrics.go` 为契约。
+- **验证结果**：`npm run test` 11 文件 96 用例全绿（新增 4 用例：渲染逐房人数/rooms 为空隐藏/5s 轮询更新/拉取失败保留旧值；fake timers 用 `shouldAdvanceTime: true` 兼容 RTL waitFor）；`npm run build`（tsc && vite build）通过。NAS 盘 vitest worker 超时为既有环境债 E1，按惯例在 D 盘副本 `D:\RiceTalk-D\rrt-web\admin`（同步源码后）运行验证，Z 盘源码为准。
+- **不涉及**：win 端（admin SPA 不进桌面客户端；未动 web/shared，无 shared 镜像同步项）；版本号不变。
+
+---
+
 ## 2026-10-02 — shared/admin：语音音质档类型正式化（C 档 U20 批次配套）
 
 ### feat(shared): Channel 新增 voiceQuality 正式类型；admin 移除 as any 断言

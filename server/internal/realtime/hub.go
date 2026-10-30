@@ -372,7 +372,7 @@ type roomSubscription struct {
 }
 
 type whiteboardSubscription struct {
-	client      *Client
+	client       *Client
 	whiteboardID string
 }
 
@@ -387,6 +387,9 @@ type channelMessage struct {
 	// security_alert 不打扰触发它的那条新登录连接）。仅 user 目标消费此
 	// 字段；无 sessionID 的旧连接不跳过（宁多发不漏发）。
 	exceptSessionID string
+	// excludeUserID 非空时，channel 目标投递跳过该用户的所有连接
+	// （A9 二期 R1：线程未读增量事件作者本人不推送）。其余 target 忽略。
+	excludeUserID string
 }
 
 type clientMessage struct {
@@ -403,11 +406,11 @@ const defaultGracefulOfflineDelay = 30 * time.Second
 type Hub struct {
 	clients               map[*Client]bool
 	channels              map[string]map[*Client]bool
-	rooms                 map[string]map[*Client]bool      // minigame roomID -> clients
-	whiteboards           map[string]map[*Client]bool      // whiteboardID -> clients
-	userClientCount       map[string]int                   // userID -> number of active connections
-	offlineTimers         map[string]*time.Timer           // userID -> graceful offline timer
-	gracefulOfflineDelay  time.Duration                    // configurable for tests
+	rooms                 map[string]map[*Client]bool // minigame roomID -> clients
+	whiteboards           map[string]map[*Client]bool // whiteboardID -> clients
+	userClientCount       map[string]int              // userID -> number of active connections
+	offlineTimers         map[string]*time.Timer      // userID -> graceful offline timer
+	gracefulOfflineDelay  time.Duration               // configurable for tests
 	broadcast             chan []byte
 	register              chan *Client
 	unregister            chan *Client
@@ -427,7 +430,7 @@ type Hub struct {
 	adminSubs     map[chan []byte]bool
 	regAdminSub   chan chan []byte
 	unregAdminSub chan chan []byte
-		log           *applogger.Logger
+	log           *applogger.Logger
 	mu            sync.RWMutex
 	// channelSharers 维护「频道 → 当前屏幕共享者 userID」的内存映射
 	//（A5-S1，DES-20261001-01 §6.2）。screenshare_started 写入、
@@ -769,6 +772,9 @@ func (h *Hub) Run() {
 				}
 				h.mu.RUnlock()
 				for client := range channelClients {
+					if cm.excludeUserID != "" && client.userID == cm.excludeUserID {
+						continue
+					}
 					select {
 					case client.send <- cm.data:
 					default:
@@ -862,7 +868,17 @@ func (h *Hub) BroadcastToChannel(channelID string, data []byte) {
 	}
 }
 
-// BroadcastToWhiteboard sends a message to all clients subscribed to a whiteboard.
+// BroadcastToChannelExcept sends a message to all clients subscribed to a channel
+// except the connections of excludeUserID（A9 二期 R1：线程未读增量事件作者本人
+// 不推送——服务端不投递，而不是让客户端自行忽略）。现有 BroadcastToChannel 语义
+// 不变（不排除任何连接）。
+func (h *Hub) BroadcastToChannelExcept(channelID, excludeUserID string, data []byte) {
+	select {
+	case h.chanMsg <- channelMessage{target: "channel", id: channelID, data: data, excludeUserID: excludeUserID}:
+	default:
+		h.log.Warn("chanMsg buffer full, dropping channel broadcast", "channel", channelID)
+	}
+} // BroadcastToWhiteboard sends a message to all clients subscribed to a whiteboard.
 func (h *Hub) BroadcastToWhiteboard(whiteboardID string, data []byte) {
 	select {
 	case h.chanMsg <- channelMessage{target: "whiteboard", id: whiteboardID, data: data}:
@@ -1237,45 +1253,45 @@ func (h *Hub) handleClientMessage(client *Client, msg *Message) {
 				return
 			}
 			h.log.Debug("presence update", "user_id", client.userID, "status", payload.Status)
-		// 同步持久化改为异步，避免阻塞整个 Hub 事件循环
-		if h.OnPresenceUpdate != nil {
-			go func(userID, status, customStatus string) {
-				if err := h.OnPresenceUpdate(userID, status, customStatus); err != nil {
-					h.log.Warn("failed to persist presence, skipping broadcast", "user_id", userID, "error", err)
-					return
-				}
-				// H16: Filter invisible status for external broadcast.
-				// invisible users appear as offline to others, but keep their real status internally.
-				broadcastStatus := status
-				if status == "invisible" {
+			// 同步持久化改为异步，避免阻塞整个 Hub 事件循环
+			if h.OnPresenceUpdate != nil {
+				go func(userID, status, customStatus string) {
+					if err := h.OnPresenceUpdate(userID, status, customStatus); err != nil {
+						h.log.Warn("failed to persist presence, skipping broadcast", "user_id", userID, "error", err)
+						return
+					}
+					// H16: Filter invisible status for external broadcast.
+					// invisible users appear as offline to others, but keep their real status internally.
+					broadcastStatus := status
+					if status == "invisible" {
+						broadcastStatus = "offline"
+					}
+					data, _ := json.Marshal(map[string]interface{}{
+						"type": "presence_update",
+						"payload": map[string]interface{}{
+							"userId":       userID,
+							"status":       broadcastStatus,
+							"customStatus": customStatus,
+						},
+					})
+					h.Broadcast(data)
+				}(client.userID, payload.Status, payload.CustomStatus)
+			} else {
+				// No persistence callback: still broadcast so local state stays in sync.
+				broadcastStatus := payload.Status
+				if payload.Status == "invisible" {
 					broadcastStatus = "offline"
 				}
 				data, _ := json.Marshal(map[string]interface{}{
 					"type": "presence_update",
 					"payload": map[string]interface{}{
-						"userId":       userID,
+						"userId":       client.userID,
 						"status":       broadcastStatus,
-						"customStatus": customStatus,
+						"customStatus": payload.CustomStatus,
 					},
 				})
 				h.Broadcast(data)
-			}(client.userID, payload.Status, payload.CustomStatus)
-		} else {
-			// No persistence callback: still broadcast so local state stays in sync.
-			broadcastStatus := payload.Status
-			if payload.Status == "invisible" {
-				broadcastStatus = "offline"
 			}
-			data, _ := json.Marshal(map[string]interface{}{
-				"type": "presence_update",
-				"payload": map[string]interface{}{
-					"userId":       client.userID,
-					"status":       broadcastStatus,
-					"customStatus": payload.CustomStatus,
-				},
-			})
-			h.Broadcast(data)
-		}
 		}
 	case "typing":
 		var payload struct {
@@ -1348,11 +1364,11 @@ func (h *Hub) handleClientMessage(client *Client, msg *Message) {
 		// 不信任客户端自报。以 screenshare_annotation 转发给频道订阅者
 		// （含共享者，供其预览回显校验）。不落库。
 		var payload struct {
-			ChannelID string        `json:"channelId"`
-			Tool      string        `json:"tool"`
-			Points    [][2]float64  `json:"points"`
-			Color     string        `json:"color"`
-			SegID     string        `json:"segId"`
+			ChannelID string       `json:"channelId"`
+			Tool      string       `json:"tool"`
+			Points    [][2]float64 `json:"points"`
+			Color     string       `json:"color"`
+			SegID     string       `json:"segId"`
 		}
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.ChannelID == "" {
 			return
@@ -1587,12 +1603,12 @@ func (h *Hub) handleClientMessage(client *Client, msg *Message) {
 		}
 	case "doc_op": // M23: 协同编辑 - 编辑操作广播
 		var payload struct {
-			DocID   string `json:"docId"`
-			OpType  string `json:"opType"` // insert / delete
-			Position int   `json:"position"`
-			Text    string `json:"text"`
-			Length  int    `json:"length"`
-			Version int    `json:"version"`
+			DocID    string `json:"docId"`
+			OpType   string `json:"opType"` // insert / delete
+			Position int    `json:"position"`
+			Text     string `json:"text"`
+			Length   int    `json:"length"`
+			Version  int    `json:"version"`
 		}
 		if err := json.Unmarshal(msg.Payload, &payload); err == nil && payload.DocID != "" &&
 			h.AuthorizeDoc != nil && h.AuthorizeDoc(client.userID, payload.DocID) {

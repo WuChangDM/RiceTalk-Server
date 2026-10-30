@@ -1,5 +1,5 @@
 // D16: 引入类型化的服务器信息/网络响应接口（与 Win 端对齐）
-import type { ServerInfoResponse, ServerNetworkResponse, PortInfo, SecurityQuestion, Whiteboard, WhiteboardStroke, UserSound, UserSoundSettings, MessageSearchResult, ServerEmoji } from './types';
+import type { ServerInfoResponse, ServerNetworkResponse, PortInfo, SecurityQuestion, Whiteboard, WhiteboardStroke, UserSound, UserSoundSettings, MessageSearchResult, ServerEmoji, ThreadUnread } from './types';
 
 // API_BASE is held inside a const object so the binding is immutable while
 // the value remains mutable through setApiBase. This avoids a top-level let
@@ -24,6 +24,7 @@ export function resetApiCoreForTests() {
   CLIENT_TYPE = 'web';
   DEVICE_NAME = '';
   refreshingPromise = null;
+  stopTokenRefreshTimer();
 }
 
 export function getApiBase(): string {
@@ -95,9 +96,52 @@ function getAccessToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
 }
 
+// ── B1-1（NJ-7）token 生命周期管理 ────────────────────────────────
+// access_token 是 JWT；客户端解析 exp（不验签，仅用于刷新时机判断）。
+
+/** 解析 JWT payload 的 exp（毫秒时间戳）；非 JWT / 无 exp 返回 null */
+export function parseTokenExpMs(token: string | null | undefined): number | null {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+    const exp = typeof payload.exp === 'number' ? payload.exp : null;
+    return exp ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** access token 剩余毫秒数；无法解析时返回 null（视为新鲜度未知，按剩余充足处理） */
+export function accessTokenRemainingMs(): number | null {
+  const exp = parseTokenExpMs(getAccessToken());
+  if (exp === null) return null;
+  return exp - Date.now();
+}
+
+/** 刷新失败的分类原因：expired=refresh token 也过期；revoked=会话被撤销/互踢/改密码 */
+export type RefreshFailureReason = 'expired' | 'revoked' | 'no_refresh_token';
+
+function getRefreshFailureReason(code?: string): RefreshFailureReason {
+  // 服务端 refresh 失败仅两种业务码：AUTH_TOKEN_EXPIRED（refresh 会话过期）、
+  // AUTH_TOKEN_INVALID（哈希不匹配=已被轮换消费 / TokenVersion bump=被下线或改密码）。
+  // 服务端无专用「互踢」码，revoked 为最近似归类（详见修复汇报诊断节）。
+  return code === 'AUTH_TOKEN_EXPIRED' ? 'expired' : 'revoked';
+}
+
+/** 按刷新失败原因生成给用户看的文案（区分「登录已过期」vs「会话已失效/可能被其他设备下线」） */
+export function describeAuthExpiredReason(reason: RefreshFailureReason): string {
+  if (reason === 'revoked') {
+    return '登录状态已失效：账号可能已在其他设备下线本机或修改了密码，请重新登录';
+  }
+  return '登录已过期，请重新登录';
+}
+
 function clearStoredAuthTokens(): void {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem('rrt_refresh_token');
+  stopTokenRefreshTimer();
 }
 
 async function refreshAccessToken(): Promise<string> {
@@ -106,7 +150,11 @@ async function refreshAccessToken(): Promise<string> {
   refreshingPromise = (async () => {
     try {
       const refreshToken = localStorage.getItem('rrt_refresh_token');
-      if (!refreshToken) throw new Error('No refresh token');
+      if (!refreshToken) {
+        const err: any = new Error('No refresh token');
+        err.reason = 'no_refresh_token' as RefreshFailureReason;
+        throw err;
+      }
 
       const res = await fetch(`${API_BASE_STATE.value}/api/auth/refresh`, {
         method: 'POST',
@@ -117,7 +165,10 @@ async function refreshAccessToken(): Promise<string> {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.code !== 'OK') {
-        throw new Error(data.chinese_message || data.message || 'Refresh failed');
+        const err: any = new Error(data.chinese_message || data.message || 'Refresh failed');
+        err.reason = getRefreshFailureReason(data.code);
+        err.code = data.code;
+        throw err;
       }
 
       const newToken = data.data.accessToken;
@@ -126,6 +177,8 @@ async function refreshAccessToken(): Promise<string> {
       if (newRefreshToken) {
         localStorage.setItem('rrt_refresh_token', newRefreshToken);
       }
+      // 拿到新 access 后重排主动刷新定时器（B1-1②：登录/刷新时重置）
+      scheduleTokenRefreshTimer();
       return newToken;
     } finally {
       refreshingPromise = null;
@@ -133,6 +186,70 @@ async function refreshAccessToken(): Promise<string> {
   })();
 
   return refreshingPromise;
+}
+
+// ── B1-1② access 剩余 <2min 主动刷新（定时器） ────────────────────
+const REFRESH_MARGIN_MS = 2 * 60 * 1000;
+// 兜底下限：exp 已非常近时至少等 5s 再刷，避免登录瞬间密集循环
+const REFRESH_MIN_DELAY_MS = 5 * 1000;
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 主动刷新定时器（模块级单例；登出/清 token 时停止） */
+function stopTokenRefreshTimer(): void {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+}
+export { stopTokenRefreshTimer };
+
+/**
+ * 主动刷新调度：在 access 剩余寿命降至 REFRESH_MARGIN_MS（2 分钟）时静默刷新。
+ * 登录 / register / refresh 成功后调用（幂等，重复调用先清旧定时器）。
+ * 刷新失败（expired/revoked）→ 派发 rrt:auth-expired（带原因 detail），由 App 层登出；
+ * 网络瞬断不登出，30s 后重试调度。
+ */
+export function scheduleTokenRefreshTimer(): void {
+  if (typeof window === 'undefined') return;
+  stopTokenRefreshTimer();
+  const remaining = accessTokenRemainingMs();
+  if (remaining === null) return; // 无法解析 exp（非 JWT），退化为纯被动 401 刷新
+  const delay = Math.max(remaining - REFRESH_MARGIN_MS, REFRESH_MIN_DELAY_MS);
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    // 期间可能已登出（token 被清）——无 token 则不再刷
+    if (!getAccessToken()) return;
+    refreshAccessToken().catch((err) => {
+      const reason: RefreshFailureReason = err?.reason;
+      if (!reason) {
+        // 网络失败：安排一次稍后的重试（30s），不登出
+        refreshTimer = setTimeout(() => {
+          refreshTimer = null;
+          if (getAccessToken()) scheduleTokenRefreshTimer();
+        }, 30 * 1000);
+        return;
+      }
+      clearStoredAuthTokens();
+      notifyAuthExpired(reason);
+    });
+  }, delay);
+}
+
+/**
+ * WS 建连前的 token 保鲜（B1-2①）：重连用旧 token 会被服务端在握手阶段
+ * 直接 401 拒绝（routes.go 对过期/版本不匹配 token 不升级连接），客户端会
+ * 陷入「用旧 token 重连 → 被拒 → 退避重试」死循环。此函数保证返回的 token
+ * 剩余寿命 > REFRESH_MARGIN_MS；刷新失败时抛出带 reason 的错误，调用方据此
+ * 终止重连（等 rrt:auth-expired 登出流程），不做无谓重试。
+ */
+export async function ensureFreshTokenForWS(): Promise<string | null> {
+  const remaining = accessTokenRemainingMs();
+  // 剩余充足（或无法解析 exp）→ 直接用现有 token
+  if (remaining === null || remaining > REFRESH_MARGIN_MS) {
+    return getAccessToken();
+  }
+  // 即将过期/已过期 → 先刷新再返回新 token（并发由 refreshingPromise 合并）
+  return refreshAccessToken();
 }
 
 function getCSRFToken(): string {
@@ -147,10 +264,12 @@ function getCSRFToken(): string {
 
 // 当 token 被清除（过期/失效）时通知应用层，触发自动登出并跳转到登录页。
 // 使用全局事件避免循环依赖（api-core 不应直接依赖 authStore）。
-function notifyAuthExpired(): void {
+// B1-1③：detail.reason 携带失败分类（'expired'|'revoked'|'no_refresh_token'），
+// App 层据此区分「登录已过期」与「账号已在其他设备下线/改密码」的提示文案。
+function notifyAuthExpired(reason: RefreshFailureReason = 'revoked'): void {
   try {
     if (typeof window !== 'undefined' && window.dispatchEvent) {
-      window.dispatchEvent(new CustomEvent('rrt:auth-expired'));
+      window.dispatchEvent(new CustomEvent('rrt:auth-expired', { detail: { reason } }));
     }
   } catch {
     // 事件派发失败不影响主流程
@@ -186,10 +305,11 @@ async function api<T>(path: string, method: string = 'GET', body?: unknown): Pro
       try {
         const newToken = await refreshAccessToken();
         return doRequest(newToken);
-      } catch {
+      } catch (refreshErr: any) {
+        const reason: RefreshFailureReason = refreshErr?.reason || 'revoked';
         clearStoredAuthTokens();
-        notifyAuthExpired();
-        throw new Error('登录已过期，请重新登录');
+        notifyAuthExpired(reason);
+        throw new Error(describeAuthExpiredReason(reason));
       }
     }
 
@@ -277,9 +397,11 @@ export async function upload<T>(url: string, formData: FormData, onProgress?: (l
         if (code === 'AUTH_TOKEN_EXPIRED') {
           refreshAccessToken().then(newToken => {
             doUpload(newToken).then(resolve, reject);
-          }).catch(() => {
+          }).catch((refreshErr: any) => {
+            const reason: RefreshFailureReason = refreshErr?.reason || 'revoked';
             clearStoredAuthTokens();
-            reject(new Error('登录已过期，请重新登录'));
+            notifyAuthExpired(reason);
+            reject(new Error(describeAuthExpiredReason(reason)));
           });
           return;
         }
@@ -497,13 +619,29 @@ function withCacheVersion(url: string): string {
 // normalizeAttachments 把相对路径的 fileUrl/thumbUrl 拼接为完整 URL 并附加 access_token。
 // 浏览器原生 <img>/<video> 标签不会带 Authorization header，需通过 query 参数鉴权。
 // 服务端 middleware/auth.go 的 authenticateRequest 支持从 access_token query 读取 token。
+// B1-3（N37/NJ-9）：对已是完整 URL 的附件做协议白名单校验——仅放行 http(s)/blob/data/
+// 相对路径；emoji:// 等自定义协议（R-1 审核白屏 DoS 向量）与 file: 一律置空，
+// 防止恶意/损坏数据把 <img src> 指到非预期协议。
+
+/** 附件/表情图片 URL 协议白名单：相对路径或安全协议才允许进渲染层 */
+export function isSafeMediaUrl(url: string): boolean {
+  if (!url) return false;
+  if (url.startsWith('/')) return true; // 相对路径，由 toFull 拼 base
+  try {
+    const protocol = new URL(url, 'http://placeholder.invalid').protocol;
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'blob:' || protocol === 'data:';
+  } catch {
+    return false;
+  }
+}
+
 function normalizeAttachments(atts: any): any[] {
   if (!Array.isArray(atts) || atts.length === 0) return atts || []
   const base = getApiBase()
   const token = getAccessToken()
   const toFull = (url?: string): string | undefined => {
     if (!url) return url
-    if (!url.startsWith('/')) return url // 已是完整 URL，不动
+    if (!url.startsWith('/')) return isSafeMediaUrl(url) ? url : undefined // 完整 URL：协议白名单外不渲染
     const full = base ? `${base}${url}` : url
     if (!token) return full
     return full + (full.includes('?') ? '&' : '?') + 'access_token=' + encodeURIComponent(token)
@@ -515,7 +653,10 @@ function normalizeAttachments(atts: any): any[] {
   }))
 }
 
-function normalizeMessage(m: any): any {
+// B1-3（N37）：导出供 WS 实时消息路径复用——此前 normalizeMessage 仅在 REST
+// 通道（getMessages/sendMessage/getThread）生效，WS 广播的 message payload 的
+// 附件保持相对路径，file:// 上下文 <img> 加载不到 → 实时附件碎图。
+export function normalizeMessage(m: any): any {
   if (!m) return m;
   const author = m.author || {};
   return {
@@ -543,7 +684,21 @@ export const getMessages = (
   const params = new URLSearchParams({ limit: String(limit) });
   if (o.cursor) params.set('cursor', o.cursor);
   if (o.around) params.set('around', o.around);
-  return apiGet<{ code: string; data: { items: any[]; hasMore: boolean; cursor?: string } }>(
+  return apiGet<{
+    code: string;
+    data: {
+      items: any[];
+      hasMore: boolean;
+      cursor?: string;
+      /**
+       * A9 二期（DES-20261029-01 §7.6.2）：around 目标本身是线程回复时，服务端改以父消息为中心取页，
+       * 并回带 threadParentId（父消息 id）+ focusMessageId（原 around 参数）。客户端据此开线程抽屉并定位。
+       * 目标非回复时不返回（旧行为逐字节不变）。
+       */
+      threadParentId?: string;
+      focusMessageId?: string;
+    };
+  }>(
     `/api/channels/${channelId}/messages?${params.toString()}`,
   ).then(res => {
     if (res.data?.items) {
@@ -570,6 +725,8 @@ export async function searchAllMessages(q: string, limit = 25): Promise<{ result
     author: r.author,
     content: r.content,
     createdAt: r.created_at,
+    // A9 二期（DES-20261029-01 §7.6.3）：服务端 wire 为 snake_case parent_id；老服务端无该字段 → undefined
+    parentId: r.parent_id || r.parentId || undefined,
   }));
   return { results, total: res.data?.total ?? results.length };
 }
@@ -675,8 +832,13 @@ export const downloadChannelFile = async (attachmentId: string, filename?: strin
 };
 // F29: 未读信息（GET /api/channels/:id/unread）。
 // 服务端 handler.GetUnreadCount → message.UnreadInfo，字段为 firstUnreadMessageId（注意不是 firstUnreadId）。
+// A9 二期（DES-20261029-01 §7.1）：新增 threadUnreads（线程独立未读，lastAt 降序、cap 20、无未读为空数组）。
+// 老服务端不返回该字段 → 声明为可选，调用方按「从未收到权威」处理（本地计数兜底）。
 export const getUnreadInfo = (channelId: string) =>
-  apiGet<{ code: string; data: { unreadCount: number; mentionCount: number; firstUnreadMessageId?: string } }>(`/api/channels/${channelId}/unread`);
+  apiGet<{
+    code: string;
+    data: { unreadCount: number; mentionCount: number; firstUnreadMessageId?: string; threadUnreads?: ThreadUnread[] };
+  }>(`/api/channels/${channelId}/unread`);
 
 // ===== 频道静音（T4/S-1）=====
 // 用户对某频道的静音记录（服务端 model.UserChannelMute）。
@@ -714,8 +876,20 @@ export const getThread = (messageId: string, limit = 50) =>
 // lastMessageId 缺省时服务端自动取频道最新一条（handler.MarkChannelRead）。
 // 读到中间某条时传该条 ID：服务端按「该条之后的消息」继续计未读（定位点语义）。
 // 成功后服务端向本人广播 unread_count_changed（unreadCount/mentionCount=0 + firstUnreadMessageId=""）。
-export const markChannelRead = (channelId: string, lastMessageId?: string) =>
-  apiPost<{ code: string; data: { message: string } }>(`/api/channels/${channelId}/mark-read`, lastMessageId ? { lastMessageId } : {});
+// A9 二期（DES-20261029-01 §7.2）：opts.threadParentId 非空 → 只标该线程已读（线程读位 upsert），
+//   **不触碰频道已读水位、不广播 unread_count_changed**，改为广播 thread_unread_changed（unreadCount=0）；
+//   不带该字段时行为与旧版逐字节一致（旧客户端/旧调用点零影响）。
+//   位置参数保持 (channelId, lastMessageId?, opts?) 兼容 channelUnreadJump.test.tsx 断言。
+export const markChannelRead = (
+  channelId: string,
+  lastMessageId?: string,
+  opts?: { threadParentId?: string },
+) => {
+  const body: { lastMessageId?: string; threadParentId?: string } = {};
+  if (lastMessageId) body.lastMessageId = lastMessageId;
+  if (opts?.threadParentId) body.threadParentId = opts.threadParentId;
+  return apiPost<{ code: string; data: { message: string } }>(`/api/channels/${channelId}/mark-read`, body);
+};
 
 export const ackMessage = (messageId: string) =>
   apiPost<{ code: string; data: any }>(`/api/messages/${messageId}/ack`, {});
@@ -917,6 +1091,10 @@ export const uploadWhiteboardThumbnail = (whiteboardId: string, base64Png: strin
 
 // Sharedoc
 export const getSharedocs = () => apiGet<{ code: string; data: any[] }>('/api/sharedoc/list');
+// FIX-20261003-01 NJ-13：单文档详情（含 content/version）。列表接口不返回内容字段，
+// 打开/重载文档必须走此端点拿真实内容（旧服务端无此路由时 404，调用方需回退列表数据）。
+export const getSharedoc = (id: string) =>
+  apiGet<{ code: string; data: { id: string; title: string; content: string; creator: string; ownerId: string; version: number; updatedAt: string } }>(`/api/sharedoc/${encodeURIComponent(id)}`);
 export const createSharedoc = (data: { title: string; content?: string }) =>
   apiPost<{ code: string; data: any }>('/api/sharedoc/create', data);
 export const updateSharedoc = (id: string, data: { title?: string; content?: string; expectedVersion?: number }) =>
@@ -1275,9 +1453,11 @@ export async function downloadBlobWithChecksum(path: string): Promise<DownloadRe
         try {
           const newToken = await refreshAccessToken();
           return doDownload(newToken);
-        } catch {
+        } catch (refreshErr: any) {
+          const reason: RefreshFailureReason = refreshErr?.reason || 'revoked';
           clearStoredAuthTokens();
-          throw new Error('登录已过期，请重新登录');
+          notifyAuthExpired(reason);
+          throw new Error(describeAuthExpiredReason(reason));
         }
       }
       if (code === 'AUTH_TOKEN_MISSING' || code === 'AUTH_TOKEN_INVALID' || code === 'AUTH_UNAUTHORIZED') {

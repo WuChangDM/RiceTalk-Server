@@ -2,6 +2,7 @@ package voice
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"log"
 	"os"
@@ -224,9 +225,12 @@ func (s *Service) GenerateTokenWithIdentity(userID, username, role, roomID, iden
 	}
 
 	at := auth.NewAccessToken(s.cfg.LiveKitAPIKey, s.cfg.LiveKitAPISecret)
-	// L13: 在 metadata 中标记 E2EE 启用状态，客户端据此决定是否启用 E2EE
 	metadataMap := map[string]string{"voice_quality": quality}
-	if s.cfg.LiveKitE2EEEnabled {
+	// L13: 在 metadata 中标记 E2EE 启用状态，客户端据此决定是否启用 E2EE。
+	// DES-20261006-01 §二：口令房（零知识模式）同样写 e2ee_enabled=true——
+	// 客户端据此走 prepareE2ee，再经 GET e2ee/key 的 mode=passphrase 分支进入口令流程。
+	// 因此口令房不依赖全局开关 RRT_LIVEKIT_E2EE_ENABLED，按房间独立生效。
+	if s.cfg.LiveKitE2EEEnabled || room.E2EEPassphraseEnabled {
 		metadataMap["e2ee_enabled"] = "true"
 	}
 	metadata, _ := json.Marshal(metadataMap)
@@ -251,7 +255,9 @@ func (s *Service) GenerateTokenWithIdentity(userID, username, role, roomID, iden
 	// (the LiveKit token has already been generated) but we log it so
 	// operators can detect persistent DB issues.
 	room.LiveKitRoom = lkRoom
-	room.E2EEEnabled = s.cfg.LiveKitE2EEEnabled
+	// E2EEEnabled 是房间级「已加密」标记（录音守卫等据此拒绝）：口令房同样是加密房。
+	// 口令清除后本式自动把该标记还原为全局开关值，无需额外清理逻辑。
+	room.E2EEEnabled = s.cfg.LiveKitE2EEEnabled || room.E2EEPassphraseEnabled
 	if err := s.db.Save(room).Error; err != nil {
 		return "", errors.New(errors.VOICE_SERVICE_UNAVAILABLE, "failed to record voice room: "+err.Error())
 	}
@@ -770,7 +776,9 @@ func (s *Service) StartRecording(userID, roomID string) (*model.VoiceRecording, 
 	// DES-2026-0912-06 §4.6：E2EE 房间的加密轨在 Egress 侧无法解密
 	// （egress 参与者拿不到客户端密钥），录出来必然是噪声/黑屏。
 	// 与其产出坏录像，不如明确拒绝并给出原因。
-	if room.E2EEEnabled {
+	// DES-20261006-01 §二：口令房（E2EEPassphraseEnabled）同样禁止录音——
+	// 密钥由各成员口令在本端派生，Egress 更不可能拿到。
+	if room.E2EEEnabled || room.E2EEPassphraseEnabled {
 		return nil, errors.New(
 			errors.VOICE_E2EE_RECORDING_UNSUPPORTED,
 			"room "+room.ID+" has end-to-end encryption enabled, recording is not supported",
@@ -871,21 +879,85 @@ func (s *Service) GetRecordings(roomID string) ([]model.VoiceRecording, error) {
 	return recordings, nil
 }
 
-// GetE2EEKey returns the E2EE key for a room. If the key doesn't exist, it generates one.
+// ===== E2EE 密钥/口令（一期 server 模式 + 二期 passphrase 零知识模式） =====
+
+// E2EE key 两种下发模式的取值（GET /voice/e2ee/key 响应里的 mode 字段）。
+const (
+	// E2EEModeServer：一期服务端分发模式——服务端生成并保管（加密落库）随机密钥，
+	// 成员经本端点取回 hex key 喂 LiveKit ExternalE2EEKeyProvider。
+	E2EEModeServer = "server"
+	// E2EEModePassphrase：二期房间口令零知识模式——服务端只回 magic 校验 blob，
+	// 密钥由各成员在本端用口令派生，服务端接触不到口令与密钥。
+	E2EEModePassphrase = "passphrase"
+)
+
+// E2EEKeyInfo 是 GET /voice/e2ee/key 的服务层结果（按 Mode 二选一填充）。
+type E2EEKeyInfo struct {
+	Mode  string `json:"mode"`
+	Key   string `json:"key,omitempty"`
+	Magic string `json:"magic,omitempty"`
+}
+
+// magic blob 约束：base64(12B salt || AES-GCM 密文)。
+// 密文 = 17B 固定明文 "RRT-E2EE-MAGIC-V1" + 16B GCM tag，理论 45B/60 字符，
+// 上限放宽到 4KB（任务约束），防御异常超大 payload 落库。
+const (
+	e2eeMagicMaxBase64Len = 4096
+	e2eeMagicMinRawLen    = 12 + 16 // salt12 + GCM tag（不带明文的理论下限）
+	e2eeMagicMaxRawLen    = 3072
+)
+
+// validateE2EEMagicBlob 校验客户端上传的 magic blob：必须是合法 base64
+// （带/不带 padding 均接受），解码后长度在 [salt12+tag, 3KB] 区间内。
+func validateE2EEMagicBlob(blob string) error {
+	if blob == "" {
+		return errors.ErrBadRequest.WithDetails("magic blob is empty")
+	}
+	if len(blob) > e2eeMagicMaxBase64Len {
+		return errors.ErrBadRequest.WithDetails("magic blob too large (max 4KB)")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(blob)
+	if err != nil {
+		// 容忍无 padding 的 base64（部分客户端实现会去 padding）
+		if decoded, err = base64.RawStdEncoding.DecodeString(blob); err != nil {
+			return errors.ErrBadRequest.WithDetails("magic blob is not valid base64")
+		}
+	}
+	if len(decoded) < e2eeMagicMinRawLen {
+		return errors.ErrBadRequest.WithDetails("magic blob too short")
+	}
+	if len(decoded) > e2eeMagicMaxRawLen {
+		return errors.ErrBadRequest.WithDetails("magic blob too large")
+	}
+	return nil
+}
+
+// GetE2EEKey returns the E2EE material for a room, mode-dispatched:
+//   - 口令房（E2EEPassphraseEnabled 且已存 magic）：mode=passphrase，只回 magic
+//     校验 blob，绝不返回密钥本体（零知识边界：服务端不持有也不下发密钥）；
+//   - 其余（含口令字段异常丢失的兜底）：mode=server，走一期逻辑——密钥不存在则
+//     生成并加密落库后下发。
+//
 // 密钥在存储时使用 AES-256 加密，返回给客户端的是解密后的原始字节。
-func (s *Service) GetE2EEKey(roomID, userID string) (string, error) {
+func (s *Service) GetE2EEKey(roomID, userID string) (*E2EEKeyInfo, error) {
 	room, err := s.getVoiceRoomByID(roomID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Verify user is a member of the room's space.
 	var count int64
 	if err := s.db.Model(&model.Membership{}).Where("space_id = ? AND user_id = ?", room.SpaceID, userID).Count(&count).Error; err != nil {
-		return "", errors.ErrInternal
+		return nil, errors.ErrInternal
 	}
 	if count == 0 {
-		return "", errors.ErrForbidden
+		return nil, errors.ErrForbidden
+	}
+
+	// 二期：口令房只回 magic 校验 blob。magic 为空视为状态异常，兜底走 server 模式
+	//（该房的一期密钥本就受空间成员权限保护，不构成越权泄露）。
+	if room.E2EEPassphraseEnabled && room.E2EEMagic != "" {
+		return &E2EEKeyInfo{Mode: E2EEModePassphrase, Magic: room.E2EEMagic}, nil
 	}
 
 	// Find or create key
@@ -895,12 +967,12 @@ func (s *Service) GetE2EEKey(roomID, userID string) (string, error) {
 			// Generate new key
 			keyBytes, err := crypto.RandomToken(32)
 			if err != nil {
-				return "", errors.ErrInternal
+				return nil, errors.ErrInternal
 			}
 			// Encrypt key with JWTSecret before storage
 			encryptedKey, err := crypto.EncryptAES(keyBytes, s.cfg.JWTSecret)
 			if err != nil {
-				return "", errors.ErrInternal
+				return nil, errors.ErrInternal
 			}
 			key = model.E2EEKey{
 				ID:       idgen.GenerateID(idgen.PrefixSession),
@@ -908,19 +980,67 @@ func (s *Service) GetE2EEKey(roomID, userID string) (string, error) {
 				KeyBytes: encryptedKey,
 			}
 			if err := s.db.Create(&key).Error; err != nil {
-				return "", errors.ErrInternal
+				return nil, errors.ErrInternal
 			}
-			return keyBytes, nil
+			return &E2EEKeyInfo{Mode: E2EEModeServer, Key: keyBytes}, nil
 		}
-		return "", errors.ErrInternal
+		return nil, errors.ErrInternal
 	}
 
 	// Decrypt existing key
 	decryptedKey, err := crypto.DecryptAES(key.KeyBytes, s.cfg.JWTSecret)
 	if err != nil {
-		return "", errors.ErrInternal
+		return nil, errors.ErrInternal
 	}
-	return decryptedKey, nil
+	return &E2EEKeyInfo{Mode: E2EEModeServer, Key: decryptedKey}, nil
+}
+
+// E2EEKeyMode 返回 GetE2EEKey 将会采用的响应模式（只读房间元数据，不读取也不生成密钥本体）。
+//
+// 供 handler 在「取密钥之前」决定是否需要频道可见性闸门（R-04）：
+//   - server 模式：本次响应会下发密钥本体 → 必须先做频道权限校验；
+//   - passphrase 模式（二期口令/零知识，客户端自持密钥，服务端只回 magic 校验 blob）：
+//     不依赖服务端下发密钥，保持既有可用性，不因频道可见性把口令人锁在门外。
+//
+// 这样既不改变原有模式判定顺序，也保证 403 分支不会读库取 key。
+func (s *Service) E2EEKeyMode(roomID string) (string, error) {
+	room, err := s.getVoiceRoomByID(roomID)
+	if err != nil {
+		return "", err
+	}
+	if room.E2EEPassphraseEnabled && room.E2EEMagic != "" {
+		return E2EEModePassphrase, nil
+	}
+	return E2EEModeServer, nil
+}
+
+// SetE2EEPassphrase 设置/清除房间口令（DES-20261006-01 §二，PUT /voice/e2ee/passphrase）。
+//   - magic 非 nil 且非空 = 启用口令模式：校验 blob 后落库（只存密文，口令不出端）；
+//   - magic 为 nil 或空 = 清除：房间退回一期服务端分发模式（一期 E2EEKey 行未动，
+//     成员可无缝取回原密钥）。
+//
+// 权限由路由层 middleware.RequireAdmin() 把关（与频道设置写接口一致）。
+func (s *Service) SetE2EEPassphrase(roomID string, magic *string) error {
+	room, err := s.getVoiceRoomByID(roomID)
+	if err != nil {
+		return err
+	}
+
+	if magic != nil && *magic != "" {
+		if err := validateE2EEMagicBlob(*magic); err != nil {
+			return err
+		}
+		room.E2EEMagic = *magic
+		room.E2EEPassphraseEnabled = true
+	} else {
+		room.E2EEMagic = ""
+		room.E2EEPassphraseEnabled = false
+	}
+
+	if err := s.db.Save(room).Error; err != nil {
+		return errors.ErrInternal
+	}
+	return nil
 }
 
 // RotateE2EEKey generates a new E2EE key for a room, invalidating the old one.

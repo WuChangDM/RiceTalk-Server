@@ -18,8 +18,10 @@ import (
 	"ridgericetalk/features/minigames/doudizhu"
 	"ridgericetalk/features/minigames/gobang"
 	"ridgericetalk/features/minigames/ludo"
+	"ridgericetalk/features/minigames/riichi"
 	"ridgericetalk/features/minigames/tictactoe"
 	"ridgericetalk/features/minigames/werewolf"
+	"ridgericetalk/features/minigames/xiangqi"
 )
 
 // GameEngine is the authoritative rule engine for a minigame.
@@ -50,6 +52,18 @@ type SpectatorStateProvider interface {
 	SpectatorState(state map[string]interface{}) map[string]interface{}
 }
 
+// PlayerStateProvider 是可选接口（M14）：当 state 里含有「玩家本不该看到、
+// 且可据以复算隐藏信息」的字段时，由引擎在玩家视角下自行剥离。
+//
+// 与 SpectatorStateProvider 的区别：观战者看的是「完全公开」的视角，
+// 而玩家既需要自己的手牌/合法动作，又不能拿到整副牌山的可复算材料。
+// 现有实现：日麻（state.snapshot 含牌山 seed 与全部动作 → 可离线复算
+// 四家手牌与摸牌顺序，见 known_issues M14）。
+// 实现该接口的引擎必须在 PlayerState 里保留「让本玩家能继续对局」的最小集合。
+type PlayerStateProvider interface {
+	PlayerState(state map[string]interface{}, userID string) map[string]interface{}
+}
+
 // EngineRegistry maps gameType IDs to their engines.
 type EngineRegistry struct {
 	engines map[string]GameEngine
@@ -64,9 +78,12 @@ func NewEngineRegistry() *EngineRegistry {
 	r.Register("tictactoe", tictactoe.New())
 	r.Register("gobang", gobang.New())
 	r.Register("chess", chess.New())
+	r.Register("xiangqi", xiangqi.New())
 	r.Register("werewolf", werewolf.New())
 	r.Register("ludo", ludo.New())
 	r.Register("doudizhu", doudizhu.New())
+	// 日本麻将（4 人，规则内核经 features/minigames/riichi/core 适配层）
+	r.Register("riichi", riichi.New())
 	return r
 }
 

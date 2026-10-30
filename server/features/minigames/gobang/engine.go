@@ -72,7 +72,13 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 	newState := util.ShallowCopy(state)
 	newState["board"] = board
 	newState["currentPlayer"] = next
-	newState["winner"] = winner
+	if draw {
+		// 满盘无五连必须写 "draw" 标记：IsGameOver 只认 winner=="draw"，
+		// 否则棋盘下满后房间永久停在 playing（无历史、无计分）。
+		newState["winner"] = "draw"
+	} else {
+		newState["winner"] = winner
+	}
 	newState["lastMove"] = map[string]int{"r": p.R, "c": p.C}
 	return newState, nil
 }
@@ -84,6 +90,9 @@ func (e *Engine) IsGameOver(state map[string]interface{}) (winnerID string, draw
 	}
 	if winner == "" {
 		return "", false
+	}
+	if winner == "draw" {
+		return "", true
 	}
 	players := util.GetStringSlice(state, "players")
 	for _, id := range players {

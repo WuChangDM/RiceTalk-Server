@@ -109,6 +109,9 @@ type Config struct {
 	AdminPortShared bool     `toml:"admin_port_shared"` // fallback: keep admin routes on API port
 	AllowedOrigins  []string `toml:"allowed_origins"`
 	LiveKitPort     int      `toml:"livekit_port"`
+	// C-P1-9：LiveKit 媒体端口参数化（同机多实例不冲突；默认 7881/7882）
+	LiveKitTCPPort  int      `toml:"livekit_tcp_port"`
+	LiveKitUDPPort  int      `toml:"livekit_udp_port"`
 	VPNPort         int      `toml:"vpn_port"`
 	DeployMode      string   `toml:"deploy_mode"` // native or docker
 
@@ -201,6 +204,8 @@ func DefaultConfig() *Config {
 		LiveKitAPISecret:          "devsecret",
 		LiveKitAutoStart:          true,
 		LiveKitPort:               7880,
+		LiveKitTCPPort:            7881,
+		LiveKitUDPPort:            7882,
 		VPNPort:                   41641,
 		DeployMode:                "native",
 		HIBPTimeout:               5,
@@ -312,6 +317,17 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("RRT_LIVEKIT_PUBLIC_URL"); v != "" {
 		cfg.LiveKitPublicURL = v
+	}
+	// C-P1-9：媒体端口参数化（同机双实例改这两项+RRT_PORT/RRT_LOCAL_DATA_PATH 即可隔离）
+	if v := os.Getenv("RRT_LIVEKIT_TCP_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			cfg.LiveKitTCPPort = p
+		}
+	}
+	if v := os.Getenv("RRT_LIVEKIT_UDP_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			cfg.LiveKitUDPPort = p
+		}
 	}
 	if v := os.Getenv("RRT_LIVEKIT_E2EE_ENABLED"); v != "" {
 		cfg.LiveKitE2EEEnabled = v == "true" || v == "1"
@@ -722,7 +738,14 @@ func loadOrGenerateProductionSecrets(cfg *Config) error {
 		log.Printf("WARN: 检测节点 IP 失败，livekit.yaml 渲染将使用占位符: %v", err)
 		nodeIP = "127.0.0.1"
 	}
-	if err := RenderLiveKitConfig(livekitTemplatePath, livekitOutputPath, s, nodeIP, DefaultLiveKitPorts()); err != nil {
+		mediaPorts := DefaultLiveKitPorts()
+	if cfg.LiveKitTCPPort > 0 {
+		mediaPorts.TCPPort = cfg.LiveKitTCPPort
+	}
+	if cfg.LiveKitUDPPort > 0 {
+		mediaPorts.UDPPort = cfg.LiveKitUDPPort
+	}
+	if err := RenderLiveKitConfig(livekitTemplatePath, livekitOutputPath, s, nodeIP, mediaPorts); err != nil {
 		// 渲染失败不阻塞启动，仅记录警告（用户可手动配置 livekit.yaml）
 		log.Printf("WARN: 渲染 livekit.yaml 失败，请手动配置: %v", err)
 	}

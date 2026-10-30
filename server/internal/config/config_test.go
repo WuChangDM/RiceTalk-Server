@@ -189,38 +189,38 @@ func TestIsAllowedOrigin(t *testing.T) {
 	}{
 		{
 			name:     "exact match https with default port",
-			origin:   "https://192.168.31.187",
-			allowed:  []string{"https://192.168.31.187:443"},
+			origin:   "https://192.0.2.10",
+			allowed:  []string{"https://192.0.2.10:443"},
 			expected: true,
 		},
 		{
 			name:     "exact match http with default port",
-			origin:   "http://192.168.31.187",
-			allowed:  []string{"http://192.168.31.187:80"},
+			origin:   "http://192.0.2.10",
+			allowed:  []string{"http://192.0.2.10:80"},
 			expected: true,
 		},
 		{
 			name:     "no match different port",
-			origin:   "https://192.168.31.187",
-			allowed:  []string{"https://192.168.31.187:8443"},
+			origin:   "https://192.0.2.10",
+			allowed:  []string{"https://192.0.2.10:8443"},
 			expected: false,
 		},
 		{
 			name:     "exact match non-default port",
-			origin:   "https://192.168.31.187:8443",
-			allowed:  []string{"https://192.168.31.187:8443"},
+			origin:   "https://192.0.2.10:8443",
+			allowed:  []string{"https://192.0.2.10:8443"},
 			expected: true,
 		},
 		{
 			name:     "empty origin matches nothing",
 			origin:   "",
-			allowed:  []string{"https://192.168.31.187:443"},
+			allowed:  []string{"https://192.0.2.10:443"},
 			expected: false,
 		},
 		{
 			name:     "multiple allowed origins",
 			origin:   "https://localhost",
-			allowed:  []string{"https://192.168.31.187:443", "https://localhost:443"},
+			allowed:  []string{"https://192.0.2.10:443", "https://localhost:443"},
 			expected: true,
 		},
 	}

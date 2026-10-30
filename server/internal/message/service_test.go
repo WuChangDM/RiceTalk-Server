@@ -30,7 +30,7 @@ func TestCreateMessage(t *testing.T) {
 		db := testutil.MustSetupTestDB()
 		svc := NewService(db)
 
-		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello, world!", idgen.NextString(), "", nil)
+		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello, world!", idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -50,7 +50,7 @@ func TestCreateMessage(t *testing.T) {
 		svc := NewService(db)
 
 		longContent := strings.Repeat("a", 2001)
-		_, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", longContent, idgen.NextString(), "", nil)
+		_, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", longContent, idgen.NextString(), "", "", nil, nil)
 		if err == nil {
 			t.Fatal("expected error for too long content, got nil")
 		}
@@ -62,13 +62,13 @@ func TestCreateMessage(t *testing.T) {
 		channelID := "channel-1"
 		userID := "user-1"
 
-		parent, err := svc.CreateMessage(channelID, userID, "testuser", "MEMBER", "parent message", idgen.NextString(), "", nil)
+		parent, err := svc.CreateMessage(channelID, userID, "testuser", "MEMBER", "parent message", idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create parent message: %v", err)
 		}
 
 		// reply with an explicit parentId
-		reply, err := svc.CreateMessage(channelID, userID, "testuser", "MEMBER", "thread reply", idgen.NextString(), parent.ID, nil)
+		reply, err := svc.CreateMessage(channelID, userID, "testuser", "MEMBER", "thread reply", idgen.NextString(), parent.ID, "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create reply message: %v", err)
 		}
@@ -109,13 +109,144 @@ func TestCreateMessage(t *testing.T) {
 		svc := NewService(db)
 
 		for _, raw := range []string{"", "   "} {
-			msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "plain message", idgen.NextString(), raw, nil)
+			msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "plain message", idgen.NextString(), raw, "", nil, nil)
 			if err != nil {
 				t.Fatalf("failed to create message: %v", err)
 			}
 			if msg.ParentID != nil {
 				t.Errorf("expected ParentID nil for parentId %q, got %v", raw, msg.ParentID)
 			}
+		}
+	})
+}
+
+// TestCreateMessageForward 消息转发（一期）：forwardFrom 显示名快照的存储与透传，
+// 以及带附件消息转发时「附件引用复制」（新建附件行指向同一 CloudFileID，零拷贝）。
+func TestCreateMessageForward(t *testing.T) {
+	t.Run("forwardFrom persisted and returned via list", func(t *testing.T) {
+		db := testutil.MustSetupTestDB()
+		svc := NewService(db)
+
+		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "转发的内容", idgen.NextString(), "", "张三", nil, nil)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if msg.ForwardFrom != "张三" {
+			t.Errorf("expected ForwardFrom 张三, got %q", msg.ForwardFrom)
+		}
+
+		// 落库校验：fresh read 仍带 forwardFrom
+		var stored model.Message
+		if err := db.First(&stored, "id = ?", msg.ID).Error; err != nil {
+			t.Fatalf("failed to reload message: %v", err)
+		}
+		if stored.ForwardFrom != "张三" {
+			t.Errorf("expected stored ForwardFrom 张三, got %q", stored.ForwardFrom)
+		}
+
+		// 读列表透传：GetMessages 返回的消息带 forwardFrom
+		msgs, _, err := svc.GetMessages("channel-1", "", 50)
+		if err != nil {
+			t.Fatalf("GetMessages failed: %v", err)
+		}
+		found := false
+		for _, m := range msgs {
+			if m.ID == msg.ID && m.ForwardFrom == "张三" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected list to contain forwarded message with ForwardFrom 张三, got %+v", msgs)
+		}
+
+		// 对照组：不传 forwardFrom 的普通消息该字段为空（空 = 非转发）
+		plain, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "普通消息", idgen.NextString(), "", "", nil, nil)
+		if err != nil {
+			t.Fatalf("failed to create plain message: %v", err)
+		}
+		if plain.ForwardFrom != "" {
+			t.Errorf("expected empty ForwardFrom for normal message, got %q", plain.ForwardFrom)
+		}
+	})
+
+	t.Run("forwardFrom longer than 64 runes rejected", func(t *testing.T) {
+		db := testutil.MustSetupTestDB()
+		svc := NewService(db)
+
+		tooLong := strings.Repeat("名", 65)
+		if _, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "内容", idgen.NextString(), "", tooLong, nil, nil); err == nil {
+			t.Fatal("expected error for forwardFrom longer than 64 characters, got nil")
+		}
+		// 边界值：恰好 64 字符应放行
+		exact := strings.Repeat("名", 64)
+		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "内容", idgen.NextString(), "", exact, nil, nil)
+		if err != nil {
+			t.Fatalf("expected 64-rune forwardFrom to be accepted, got %v", err)
+		}
+		if msg.ForwardFrom != exact {
+			t.Errorf("expected ForwardFrom kept as-is, got %q", msg.ForwardFrom)
+		}
+	})
+
+	t.Run("forward with attachmentIds copies attachment references", func(t *testing.T) {
+		db := testutil.MustSetupTestDB()
+		svc := NewService(db)
+
+		// 源消息 + 直接落库一条源附件（物理文件由 cloudfs 管理，复制路径只关心附件行字段）
+		srcMsg, err := svc.CreateMessage("channel-1", "user-1", "alice", "MEMBER", "看这张图", idgen.NextString(), "", "", nil, nil)
+		if err != nil {
+			t.Fatalf("failed to create source message: %v", err)
+		}
+		srcAtt := &model.MessageAttachment{
+			ID:          idgen.NextString(),
+			MessageID:   srcMsg.ID,
+			Type:        "image",
+			FileName:    "pic.png",
+			FileSize:    12345,
+			MimeType:    "image/png",
+			FileURL:     "/api/channel-files/src-att",
+			ThumbURL:    "/api/channel-files/src-att?thumb=1",
+			Width:       800,
+			Height:      600,
+			CloudFileID: "cloudfs-1",
+		}
+		if err := db.Create(srcAtt).Error; err != nil {
+			t.Fatalf("failed to seed source attachment: %v", err)
+		}
+
+		// 转发：纯附件复制（content 为空 + forwardFrom + attachmentIds）
+		fwd, err := svc.CreateMessage("channel-2", "user-2", "bob", "MEMBER", "", idgen.NextString(), "", "alice", nil, []string{srcAtt.ID})
+		if err != nil {
+			t.Fatalf("failed to forward message: %v", err)
+		}
+		if fwd.ForwardFrom != "alice" {
+			t.Errorf("expected ForwardFrom alice, got %q", fwd.ForwardFrom)
+		}
+		// 消息类型按源附件类型推导为 image
+		if fwd.Type != "image" {
+			t.Errorf("expected forwarded message type image, got %q", fwd.Type)
+		}
+		// 附件引用复制：新附件行指向同一 CloudFileID，文件名/尺寸保留
+		if len(fwd.Attachments) != 1 {
+			t.Fatalf("expected 1 copied attachment, got %d", len(fwd.Attachments))
+		}
+		copied := fwd.Attachments[0]
+		if copied.ID == srcAtt.ID {
+			t.Error("expected copied attachment to have a new ID")
+		}
+		if copied.CloudFileID != srcAtt.CloudFileID {
+			t.Errorf("expected copied attachment to reuse CloudFileID %q, got %q", srcAtt.CloudFileID, copied.CloudFileID)
+		}
+		if copied.FileName != srcAtt.FileName || copied.FileSize != srcAtt.FileSize {
+			t.Errorf("expected copied attachment metadata preserved, got %+v", copied)
+		}
+		if copied.MessageID != fwd.ID {
+			t.Errorf("expected copied attachment to belong to forwarded message %s, got %s", fwd.ID, copied.MessageID)
+		}
+
+		// 未知源附件 ID 宽松忽略：content 为空且全部未命中时报「内容或附件必填」
+		if _, err := svc.CreateMessage("channel-2", "user-2", "bob", "MEMBER", "", idgen.NextString(), "", "alice", nil, []string{"nonexistent"}); err == nil {
+			t.Fatal("expected error when no attachment ID resolves and content is empty, got nil")
 		}
 	})
 }
@@ -127,7 +258,7 @@ func TestGetMessages(t *testing.T) {
 
 		channelID := "channel-1"
 		for i := 0; i < 15; i++ {
-			_, err := svc.CreateMessage(channelID, "user-1", "testuser", "", "msg"+idgen.NextString(), idgen.NextString(), "", nil)
+			_, err := svc.CreateMessage(channelID, "user-1", "testuser", "", "msg"+idgen.NextString(), idgen.NextString(), "", "", nil, nil)
 			if err != nil {
 				t.Fatalf("failed to create message: %v", err)
 			}
@@ -151,7 +282,7 @@ func TestGetMessages(t *testing.T) {
 
 		channelID := "channel-1"
 		for i := 0; i < 3; i++ {
-			_, err := svc.CreateMessage(channelID, "user-1", "testuser", "", "msg"+idgen.NextString(), idgen.NextString(), "", nil)
+			_, err := svc.CreateMessage(channelID, "user-1", "testuser", "", "msg"+idgen.NextString(), idgen.NextString(), "", "", nil, nil)
 			if err != nil {
 				t.Fatalf("failed to create message: %v", err)
 			}
@@ -355,7 +486,7 @@ func TestGetMessage(t *testing.T) {
 		db := testutil.MustSetupTestDB()
 		svc := NewService(db)
 
-		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", nil)
+		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create message: %v", err)
 		}
@@ -463,7 +594,7 @@ func TestSnapshotOverwrittenByRename(t *testing.T) {
 	}
 
 	// Send message (snapshot should be recorded)
-	msg, err := svc.CreateMessage("channel-1", "user-1", "alice", "MEMBER", "Hello!", idgen.NextString(), "", nil)
+	msg, err := svc.CreateMessage("channel-1", "user-1", "alice", "MEMBER", "Hello!", idgen.NextString(), "", "", nil, nil)
 	if err != nil {
 		t.Fatalf("failed to create message: %v", err)
 	}
@@ -565,7 +696,7 @@ func TestConcurrentGetMessages(t *testing.T) {
 	}
 
 	for i := 0; i < 50; i++ {
-		_, err := svc.CreateMessage("channel-1", "user-1", "perf", "MEMBER", "msg"+idgen.NextString(), idgen.NextString(), "", nil)
+		_, err := svc.CreateMessage("channel-1", "user-1", "perf", "MEMBER", "msg"+idgen.NextString(), idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create message: %v", err)
 		}
@@ -607,7 +738,7 @@ func TestAddReaction(t *testing.T) {
 		db := testutil.MustSetupTestDB()
 		svc := NewService(db)
 
-		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", nil)
+		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create message: %v", err)
 		}
@@ -636,7 +767,7 @@ func TestAddReaction(t *testing.T) {
 		db := testutil.MustSetupTestDB()
 		svc := NewService(db)
 
-		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", nil)
+		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create message: %v", err)
 		}
@@ -671,7 +802,7 @@ func TestRemoveReaction(t *testing.T) {
 		db := testutil.MustSetupTestDB()
 		svc := NewService(db)
 
-		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", nil)
+		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create message: %v", err)
 		}
@@ -696,7 +827,7 @@ func TestMarkChannelRead(t *testing.T) {
 		db := testutil.MustSetupTestDB()
 		svc := NewService(db)
 
-		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", nil)
+		msg, err := svc.CreateMessage("channel-1", "user-1", "testuser", "MEMBER", "Hello", idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create message: %v", err)
 		}
@@ -792,7 +923,7 @@ func TestCreateMessageStoresRewrittenMentions(t *testing.T) {
 		t.Fatalf("create membership: %v", err)
 	}
 
-	msg, err := svc.CreateMessage("channel-m2", "user_sender", "sender", "MEMBER", "嗨 @卡罗尔 在吗", idgen.NextString(), "", nil)
+	msg, err := svc.CreateMessage("channel-m2", "user_sender", "sender", "MEMBER", "嗨 @卡罗尔 在吗", idgen.NextString(), "", "", nil, nil)
 	if err != nil {
 		t.Fatalf("create message: %v", err)
 	}
@@ -839,7 +970,7 @@ func TestCreateMessageWithAttachmentsArchivesOutsideTransaction(t *testing.T) {
 		mustFileHeader(t, "notes.txt", []byte("attachment body")),
 	}
 
-	msg, err := svc.CreateMessage(chID, userID, "tester", "OWNER", "with attachments", "", "", files)
+	msg, err := svc.CreateMessage(chID, userID, "tester", "OWNER", "with attachments", "", "", "", files, nil)
 	if err != nil {
 		t.Fatalf("create message with attachments: %v", err)
 	}

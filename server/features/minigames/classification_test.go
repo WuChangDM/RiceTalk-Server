@@ -108,8 +108,27 @@ func TestGetGamesExposesCategoryAndLeaderboardMeta(t *testing.T) {
 		}
 	}
 
-	multi := []string{"tictactoe", "chess", "gobang", "werewolf", "ludo", "doudizhu"}
-	for _, id := range multi {
+	// D1（task-65）：可判胜负的联机棋类改为服务端权威计分（胜场数），
+	// 客户端不可上报分数；狼人杀/斗地主/日麻仍无排行榜。
+	authoritative := []string{"tictactoe", "chess", "gobang", "ludo", "xiangqi"}
+	for _, id := range authoritative {
+		g, ok := byID[id]
+		if !ok {
+			t.Fatalf("expected multiplayer game %q in list", id)
+		}
+		if g["category"] != "multi" {
+			t.Errorf("%s: expected category multi, got %v", id, g["category"])
+		}
+		if dim, _ := g["scoreDimension"].(string); dim != authoritativeScoreDimension {
+			t.Errorf("%s: expected authoritative dimension %q, got %q", id, authoritativeScoreDimension, dim)
+		}
+		if order, _ := g["scoreOrder"].(string); order != "desc" {
+			t.Errorf("%s: expected scoreOrder desc, got %v", id, g["scoreOrder"])
+		}
+	}
+
+	noLeaderboard := []string{"werewolf", "doudizhu", "riichi"}
+	for _, id := range noLeaderboard {
 		g, ok := byID[id]
 		if !ok {
 			t.Fatalf("expected multiplayer game %q in list", id)
@@ -214,15 +233,35 @@ func TestLeaderboardAscendingKeepsMinimum(t *testing.T) {
 	}
 }
 
-// TestLeaderboardRejectsMultiplayerGame verifies 多人联机游戏无排行榜（设计 §15.7.4）。
+// TestLeaderboardRejectsMultiplayerGame verifies 无排行榜的多人联机游戏拒绝上报（设计 §15.7.4）。
+// D1（task-65）后棋类改为服务端权威计分：上报返回 200 但 authoritative=true 且不落库
+// （见 score_test.go 的 TestSubmitScoreAuthoritativeForBoardGames），此处验证其余品类仍 400。
 func TestLeaderboardRejectsMultiplayerGame(t *testing.T) {
 	_, r, db := setupTestHandler(t, nil)
 	seedMembership(t, db, "space-1", "user-1")
 
-	for _, gameType := range []string{"tictactoe", "gobang", "doudizhu", "werewolf"} {
+	for _, gameType := range []string{"doudizhu", "werewolf", "riichi"} {
 		w, _ := doPost(t, r, "/api/v1/minigames/leaderboard", map[string]interface{}{"gameType": gameType, "score": 10})
 		if w.Code != http.StatusBadRequest {
-			t.Errorf("%s: expected 400 (multiplayer games have no leaderboard), got %d", gameType, w.Code)
+			t.Errorf("%s: expected 400 (no leaderboard for this game), got %d", gameType, w.Code)
+		}
+	}
+
+	// 棋类：客户端分数被忽略（200 + authoritative），不产生排行榜记录。
+	for _, gameType := range []string{"tictactoe", "gobang"} {
+		w, resp := doPost(t, r, "/api/v1/minigames/leaderboard", map[string]interface{}{"gameType": gameType, "score": 10})
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: expected 200 (authoritative scoring ignores client score), got %d", gameType, w.Code)
+			continue
+		}
+		data, _ := resp["data"].(map[string]interface{})
+		if data["authoritative"] != true || data["updated"] != false {
+			t.Errorf("%s: expected authoritative=true updated=false, got %v", gameType, data)
+		}
+		var count int64
+		db.Model(&model.MinigameLeaderboard{}).Where("game_type = ?", gameType).Count(&count)
+		if count != 0 {
+			t.Errorf("%s: client-reported score must not be stored, got %d rows", gameType, count)
 		}
 	}
 }

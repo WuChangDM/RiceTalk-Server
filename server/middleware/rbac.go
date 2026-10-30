@@ -160,6 +160,117 @@ func IsAdmin(c *gin.Context) bool {
 	return role == RoleOwner || role == RoleAdmin
 }
 
+// CheckChannelAccess 是频道访问判定的纯内核（不查库）：把已取出的频道元数据 +
+// role-specific 权限行的 CanView（nil = 权限行不存在）交给同一套口径判定。
+// ChannelPermission 中间件与「频道 ID 不在路由参数 :id 上」的调用方（如线程查询：
+// 频道由父消息反查）必须共用本函数，禁止各自复制一份权限逻辑。
+// 判定口径（§6.5A）：
+//   - public: 所有已认证成员可访问
+//   - admin-only: 仅 OWNER/ADMIN
+//   - role-specific: 以 ChannelRolePermission.CanView 为准
+//   - 未知 visibility: 默认拒绝
+//
+// OWNER 始终放行。返回 nil 表示放行，否则返回应直接回写客户端的错误。
+func CheckChannelAccess(c *gin.Context, ch *model.Channel, roleCanView *bool) *errors.AppError {
+	if ch == nil {
+		return errors.New(errors.CHANNEL_NOT_FOUND, "channel not found")
+	}
+	// dm 频道（legacy-only）与其他私有通道不经本权限通道访问。
+	if strings.EqualFold(ch.Type, "dm") {
+		return errors.New(errors.CHANNEL_NOT_FOUND, "channel not found")
+	}
+
+	userRole := GetRole(c)
+	// OWNER has full access to supported channel types.
+	if userRole == RoleOwner {
+		return nil
+	}
+
+	switch ch.Visibility {
+	case "public", "":
+		// allow all authenticated members
+		return nil
+	case "admin-only":
+		if userRole == RoleAdmin {
+			return nil
+		}
+		return errors.New(errors.CHANNEL_ACCESS_DENIED, "channel requires admin role")
+	case "role-specific":
+		if roleCanView == nil {
+			return errors.New(errors.CHANNEL_ACCESS_DENIED, "no permission for this channel")
+		}
+		if !*roleCanView {
+			return errors.New(errors.CHANNEL_ACCESS_DENIED, "view permission denied")
+		}
+		return nil
+	default:
+		// Unknown visibility — deny by default
+		return errors.New(errors.CHANNEL_ACCESS_DENIED, "unknown channel visibility")
+	}
+}
+
+// loadRoleCanView 取某角色在指定频道的 role-specific 权限行 CanView。
+// 权限行不存在返回 (nil, nil)，由 CheckChannelAccess 统一转成 CHANNEL_ACCESS_DENIED；
+// 数据库故障返回 ErrInternal，保持与旧 ChannelPermission 相同的 500 语义。
+func loadRoleCanView(db *gorm.DB, channelID, role string) (*bool, *errors.AppError) {
+	var perm model.ChannelRolePermission
+	if err := db.Where("channel_id = ? AND role = ?", channelID, role).First(&perm).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, errors.ErrInternal
+	}
+	return &perm.CanView, nil
+}
+
+// AuthorizeChannel 按频道 ID 取频道（必要时补 role-specific 权限行）后调用
+// CheckChannelAccess 判定，供 ChannelPermission 中间件使用。
+func AuthorizeChannel(c *gin.Context, db *gorm.DB, channelID string) *errors.AppError {
+	if channelID == "" {
+		return errors.ErrBadRequest.WithDetails("channel id required")
+	}
+
+	// OWNER 短路：先于「频道可见性 + role-specific 权限行」加载（与重构前顺序一致：
+	// OWNER 不因权限行查询故障从放行变 500）。dm 例外仍保留——私信不参与频道权限模型，
+	// 任何角色一律 404，故 OWNER 只需读一次频道类型即可判定。
+	// 但频道元数据查询本身失败（非 ErrRecordNotFound）时 fail-closed 返回 500：
+	// 故障时后续业务查询同样会失败，fail-open 收益为零，且无法判定目标是否 dm。
+	if GetRole(c) == RoleOwner {
+		var ownerCh model.Channel
+		ownerErr := db.Select("id", "type").First(&ownerCh, "id = ?", channelID).Error
+		switch {
+		case ownerErr == nil:
+			if strings.EqualFold(ownerCh.Type, "dm") {
+				return errors.New(errors.CHANNEL_NOT_FOUND, "channel not found")
+			}
+			return nil
+		case ownerErr == gorm.ErrRecordNotFound:
+			return errors.New(errors.CHANNEL_NOT_FOUND, "channel not found")
+		default:
+			// DB 故障无法判定是否 dm：鉴权 fail-closed，与「非 ErrRecordNotFound → 500」一致。
+			return errors.ErrInternal
+		}
+	}
+
+	var ch model.Channel
+	if err := db.Select("id, type, visibility").First(&ch, "id = ?", channelID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return errors.New(errors.CHANNEL_NOT_FOUND, "channel not found")
+		}
+		return errors.ErrInternal
+	}
+
+	var roleCanView *bool
+	if ch.Visibility == "role-specific" {
+		var appErr *errors.AppError
+		roleCanView, appErr = loadRoleCanView(db, channelID, GetRole(c))
+		if appErr != nil {
+			return appErr
+		}
+	}
+	return CheckChannelAccess(c, &ch, roleCanView)
+}
+
 // ChannelPermission returns a middleware that checks channel-level access
 // based on the channel's visibility setting (§6.5A):
 //   - public: allow all authenticated members
@@ -167,69 +278,14 @@ func IsAdmin(c *gin.Context) bool {
 //   - role-specific: consult ChannelRolePermission table for the user's role
 //
 // OWNER always has full access regardless of visibility.
-// The channel ID is read from the ":id" URL parameter.
+// The channel ID is read from the ":id" URL parameter. 若频道 ID 不在 :id 上
+// （如线程查询由父消息反查频道），请直接调用 CheckChannelAccess/AuthorizeChannel。
 func ChannelPermission(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		channelID := c.Param("id")
-		if channelID == "" {
-			errors.JSONError(c, errors.ErrBadRequest.WithDetails("channel id required"))
+		if appErr := AuthorizeChannel(c, db, c.Param("id")); appErr != nil {
+			errors.JSONError(c, appErr)
 			return
 		}
-
-		var ch model.Channel
-		if err := db.Select("id, type, visibility").First(&ch, "id = ?", channelID).Error; err != nil {
-			if err == gorm.ErrRecordNotFound {
-				errors.JSONError(c, errors.New(errors.CHANNEL_NOT_FOUND, "channel not found"))
-			} else {
-				errors.JSONError(c, errors.ErrInternal)
-			}
-			return
-		}
-		if strings.EqualFold(ch.Type, "dm") {
-			errors.JSONError(c, errors.New(errors.CHANNEL_NOT_FOUND, "channel not found"))
-			return
-		}
-
-		userRole := GetRole(c)
-		// OWNER has full access to supported channel types.
-		if userRole == RoleOwner {
-			c.Next()
-			return
-		}
-
-		switch ch.Visibility {
-		case "public", "":
-			// allow all authenticated members
-			c.Next()
-			return
-		case "admin-only":
-			if userRole == RoleAdmin {
-				c.Next()
-				return
-			}
-			errors.JSONError(c, errors.New(errors.CHANNEL_ACCESS_DENIED, "channel requires admin role"))
-			return
-		case "role-specific":
-			// Query ChannelRolePermission for the user's role
-			var perm model.ChannelRolePermission
-			if err := db.Where("channel_id = ? AND role = ?", channelID, userRole).First(&perm).Error; err != nil {
-				if err == gorm.ErrRecordNotFound {
-					errors.JSONError(c, errors.New(errors.CHANNEL_ACCESS_DENIED, "no permission for this channel"))
-					return
-				}
-				errors.JSONError(c, errors.ErrInternal)
-				return
-			}
-			if !perm.CanView {
-				errors.JSONError(c, errors.New(errors.CHANNEL_ACCESS_DENIED, "view permission denied"))
-				return
-			}
-			c.Next()
-			return
-		default:
-			// Unknown visibility — deny by default
-			errors.JSONError(c, errors.New(errors.CHANNEL_ACCESS_DENIED, "unknown channel visibility"))
-			return
-		}
+		c.Next()
 	}
 }

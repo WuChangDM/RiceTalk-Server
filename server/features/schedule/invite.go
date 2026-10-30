@@ -266,10 +266,11 @@ func inviteUpdatedRecipients(invites []model.ScheduleEventInvite) []string {
 }
 
 // buildInviteUpdatedMessage 组装 schedule_invite_updated WS 消息（A8-S2）。
-func buildInviteUpdatedMessage(event model.ScheduleEvent, invites []model.ScheduleEventInvite) []byte {
+// invites 用 buildInviteInfos 的产物（含 displayName，与 GET /invites 响应同构）。
+func buildInviteUpdatedMessage(event model.ScheduleEvent, invites []InviteInfo) []byte {
 	inv := make([]map[string]string, 0, len(invites))
 	for _, it := range invites {
-		inv = append(inv, map[string]string{"userId": it.UserID, "status": it.Status})
+		inv = append(inv, map[string]string{"userId": it.UserID, "displayName": it.DisplayName, "status": it.Status})
 	}
 	data, _ := json.Marshal(map[string]interface{}{
 		"type": "schedule_invite_updated",
@@ -288,7 +289,9 @@ func (h *Handler) broadcastInviteUpdated(event model.ScheduleEvent, invites []mo
 	if h.hub == nil || len(invites) == 0 {
 		return
 	}
-	h.hub.BroadcastToUsers(inviteUpdatedRecipients(invites), buildInviteUpdatedMessage(event, invites))
+	// U-new-2：WS payload 与 GET /invites 同构（带 displayName）——受邀成员
+	// 详情不再先显示 userId 后等刷新；displayName 查询失败时降级为 userId。
+	h.hub.BroadcastToUsers(inviteUpdatedRecipients(invites), buildInviteUpdatedMessage(event, h.buildInviteInfos(invites)))
 }
 
 // buildInviteRespondedMessage 组装 schedule_invite_responded WS 消息（A8-S2）。

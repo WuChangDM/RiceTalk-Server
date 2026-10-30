@@ -83,6 +83,11 @@ export interface Message {
   createdAt: string;
   reactions?: { emoji: string; userId: string }[];
   parentId?: string;
+  /**
+   * A9 二期（DES-20261029-01 §7.7）：该消息线程的回复总数（服务端按当页主消息 id 批量 GROUP BY 下发）。
+   * 主列表过滤线程回复后客户端无法再靠本地统计得出，必须以本字段为准；空线程为 0（实现恒有值）。
+   */
+  threadReplyCount?: number;
   clientMessageId?: string;
   pending?: boolean;
   failed?: boolean;
@@ -110,6 +115,21 @@ export interface MessageSearchResult {
   author: string;
   content: string;
   createdAt: string;
+  /**
+   * A9 二期（DES-20261029-01 §7.6.3）：命中的是线程回复时服务端 GlobalSearchResult 补 parent_id（task-6 落地）。
+   * 客户端据此改走「打开父消息线程抽屉 + 定位该回复」，无值则走 around 邻域页。
+   */
+  parentId?: string;
+}
+
+/**
+ * A9 二期（DES-20261029-01 §7.1）：`GET /channels/{id}/unread` 新增的线程未读条目。
+ * lastAt = 线程内最后一条未读回复时间（服务端按此降序、cap 20 返回）；无未读线程时返回空数组。
+ */
+export interface ThreadUnread {
+  parentId: string;
+  count: number;
+  lastAt: string;
 }
 
 /**

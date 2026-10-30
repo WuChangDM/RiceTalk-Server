@@ -3,6 +3,7 @@ package message
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/disintegration/imaging"
 	"gorm.io/gorm"
@@ -126,7 +128,7 @@ func (s *Service) GetMessages(channelID string, cursor string, limit int) ([]mod
 		limit = 50
 	}
 
-	query := s.db.Where("channel_id = ?", channelID).Order("created_at DESC")
+	query := s.db.Where("channel_id = ? AND parent_id IS NULL", channelID).Order("created_at DESC")
 	if cursor != "" {
 		var cursorMsg model.Message
 		if err := s.db.First(&cursorMsg, "id = ?", cursor).Error; err != nil {
@@ -233,7 +235,30 @@ func (s *Service) enrichMessages(messages []model.Message) {
 // this page (client keeps paginating backwards with items[0].id as cursor).
 // The target must exist AND belong to channelID, otherwise MESSAGE_NOT_FOUND
 // (404) is returned.
+// AroundInfo 是 around（邻域页）查询的完整结果（A9 二期）。
+// ThreadParentID 非空表示 around 命中的是线程回复，页已改为以父消息为中心；
+// FocusMessageID 为客户端最初请求定位的消息 ID（回复本身不在页内）。
+type AroundInfo struct {
+	Messages       []model.Message
+	HasMore        bool
+	ThreadParentID string
+	FocusMessageID string
+}
+
+// GetMessagesAround 保留旧签名（页面消息 + hasMore），内部委托 AroundMessages。
 func (s *Service) GetMessagesAround(channelID, aroundID string, limit int) ([]model.Message, bool, error) {
+	info, err := s.AroundMessages(channelID, aroundID, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	return info.Messages, info.HasMore, nil
+}
+
+// AroundMessages returns one page centred on aroundID.
+// A9 二期：目标查询本身不过滤线程回复（否则回复无法被定位），但页面邻居
+// 一律只取顶层消息（parent_id IS NULL）——线程回复不进主列表。若目标是
+// 线程回复，则以父消息为中心重跑取页，并回报 threadParentId/focusMessageId。
+func (s *Service) AroundMessages(channelID, aroundID string, limit int) (*AroundInfo, error) {
 	if limit < 1 || limit > 100 {
 		limit = 50
 	}
@@ -241,16 +266,31 @@ func (s *Service) GetMessagesAround(channelID, aroundID string, limit int) ([]mo
 	var target model.Message
 	if err := s.db.First(&target, "id = ? AND channel_id = ?", aroundID, channelID).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
-			return nil, false, errors.New(errors.MESSAGE_NOT_FOUND, "message not found")
+			return nil, errors.New(errors.MESSAGE_NOT_FOUND, "message not found")
 		}
-		return nil, false, errors.ErrInternal
+		return nil, errors.ErrInternal
+	}
+
+	focusMessageID := ""
+	threadParentID := ""
+	if target.ParentID != nil && *target.ParentID != "" {
+		var parent model.Message
+		if err := s.db.First(&parent, "id = ? AND channel_id = ?", *target.ParentID, channelID).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil, errors.New(errors.MESSAGE_NOT_FOUND, "message not found")
+			}
+			return nil, errors.ErrInternal
+		}
+		focusMessageID = target.ID
+		threadParentID = parent.ID
+		target = parent
 	}
 
 	// Older neighbours, newest-first; fetch one extra to compute hasMore.
 	var before []model.Message
-	if err := s.db.Where("channel_id = ? AND created_at < ?", channelID, target.CreatedAt).
+	if err := s.db.Where("channel_id = ? AND parent_id IS NULL AND created_at < ?", channelID, target.CreatedAt).
 		Order("created_at DESC").Limit((limit-1)/2 + 1).Find(&before).Error; err != nil {
-		return nil, false, errors.ErrInternal
+		return nil, errors.ErrInternal
 	}
 	hasMore := len(before) > (limit-1)/2
 	if hasMore {
@@ -261,9 +301,9 @@ func (s *Service) GetMessagesAround(channelID, aroundID string, limit int) ([]mo
 	// centred budget when fewer older messages exist (boundary clamp).
 	afterCount := limit - 1 - len(before)
 	var after []model.Message
-	if err := s.db.Where("channel_id = ? AND created_at > ?", channelID, target.CreatedAt).
+	if err := s.db.Where("channel_id = ? AND parent_id IS NULL AND created_at > ?", channelID, target.CreatedAt).
 		Order("created_at ASC").Limit(afterCount).Find(&after).Error; err != nil {
-		return nil, false, errors.ErrInternal
+		return nil, errors.ErrInternal
 	}
 
 	messages := make([]model.Message, 0, len(before)+1+len(after))
@@ -275,7 +315,12 @@ func (s *Service) GetMessagesAround(channelID, aroundID string, limit int) ([]mo
 
 	s.enrichMessages(messages)
 
-	return messages, hasMore, nil
+	return &AroundInfo{
+		Messages:       messages,
+		HasMore:        hasMore,
+		ThreadParentID: threadParentID,
+		FocusMessageID: focusMessageID,
+	}, nil
 }
 
 // SearchMessages searches messages in a channel by content (case-insensitive).
@@ -376,6 +421,7 @@ type GlobalSearchOptions struct {
 // GlobalSearchResult is the stable wire representation for global search.
 type GlobalSearchResult struct {
 	MessageID   string    `json:"message_id"`
+	ParentID    *string   `json:"parent_id"` // A9 二期：线程回复时指向父消息（顶层消息为 null）
 	ChannelID   string    `json:"channel_id"`
 	ChannelName string    `json:"channel_name"`
 	AuthorID    string    `json:"author_id"`
@@ -406,7 +452,7 @@ func (s *Service) SearchAllMessages(options GlobalSearchOptions) ([]GlobalSearch
 				m.user_id AS author_id,
 				COALESCE(NULLIF(u.display_name, ''), NULLIF(u.username, ''),
 					NULLIF(m.author_display_name, ''), m.author_username) AS author,
-				m.content, m.created_at`).
+				m.content, m.created_at, m.parent_id AS parent_id`).
 			Joins("JOIN channels AS c ON c.id = m.channel_id").
 			Joins("LEFT JOIN users AS u ON u.id = m.user_id").
 			Where("m.deleted_at IS NULL AND c.deleted_at IS NULL").
@@ -444,13 +490,43 @@ func (s *Service) SearchAllMessages(options GlobalSearchOptions) ([]GlobalSearch
 // CreateMessage creates a new message with optional file attachments.
 // content may be empty when attachments are present. parentID is ignored in this
 // simplified design (reply/thread removed).
-func (s *Service) CreateMessage(channelID, userID, username, role, content, clientMessageID, parentID string, files []*multipart.FileHeader) (*model.Message, error) {
+//
+// 消息转发（一期）扩展参数：
+//   - forwardFrom：转发来源作者显示名快照。可空；非空时仅做长度校验（≤64 字符），
+//     服务端不解析、不与被转发消息联动（无引用、无反向链接），只原样落库展示。
+//   - attachmentIDs：转发复制附件的源附件 ID 列表（带附件消息转发时由客户端传入）。
+//     实现为「附件引用复制」：为每条源附件新建一条 MessageAttachment 行并指向同一
+//     CloudFileID，物理文件零拷贝；源附件不存在/非法 ID 宽松忽略（不阻断转发）。
+//     权限模型沿用私有部署语义：调用者能读到源消息（可见即可转发），目标频道的
+//     写权限由路由中间件 ChannelPermission 把关。
+func (s *Service) CreateMessage(channelID, userID, username, role, content, clientMessageID, parentID, forwardFrom string, files []*multipart.FileHeader, attachmentIDs []string) (*model.Message, error) {
 	content = strings.TrimSpace(content)
-	if content == "" && len(files) == 0 {
+	forwardFrom = strings.TrimSpace(forwardFrom)
+	if content == "" && len(files) == 0 && len(attachmentIDs) == 0 {
 		return nil, errors.ErrBadRequest.WithDetails("message content or attachments required")
 	}
 	if len(files) > 10 {
 		return nil, errors.ErrBadRequest.WithDetails("too many attachments (max 10)")
+	}
+	// 去重去空后的复制附件 ID 清单，上限与上传附件一致（10 个）。
+	cleanAttIDs := make([]string, 0, len(attachmentIDs))
+	seenAttIDs := make(map[string]struct{}, len(attachmentIDs))
+	for _, id := range attachmentIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, dup := seenAttIDs[id]; dup {
+			continue
+		}
+		seenAttIDs[id] = struct{}{}
+		cleanAttIDs = append(cleanAttIDs, id)
+	}
+	if len(cleanAttIDs) > 10 {
+		return nil, errors.ErrBadRequest.WithDetails("too many attachments (max 10)")
+	}
+	if utf8.RuneCountInString(forwardFrom) > maxForwardFromLen {
+		return nil, errors.ErrBadRequest.WithDetails(fmt.Sprintf("forwardFrom too long (max %d characters)", maxForwardFromLen))
 	}
 	if len(content) > 0 {
 		if valid, reason := validator.ValidateMessageContent(content); !valid {
@@ -518,9 +594,53 @@ func (s *Service) CreateMessage(channelID, userID, username, role, content, clie
 		}
 	}
 
+	msgID := idgen.GenerateID(idgen.PrefixMessage)
+	// 转发复制附件：先按源附件 ID 批量加载，再为每条源附件生成新行（新附件 ID、
+	// 复用源附件的类型/文件名/尺寸/CloudFileID）。缩略图按附件 ID 独立存储，新行
+	// 没有 thumb 文件，DownloadAttachment(?thumb=1) 会自动回退原图，无需额外处理。
+	copiedAtts := make([]*model.MessageAttachment, 0, len(cleanAttIDs))
+	if len(cleanAttIDs) > 0 {
+		var srcs []model.MessageAttachment
+		if err := s.db.Where("id IN ?", cleanAttIDs).Find(&srcs).Error; err != nil {
+			return nil, errors.ErrInternal
+		}
+		srcByID := make(map[string]model.MessageAttachment, len(srcs))
+		for _, src := range srcs {
+			srcByID[src.ID] = src
+		}
+		for _, id := range cleanAttIDs {
+			src, ok := srcByID[id]
+			if !ok {
+				continue // 源附件不存在（已删除/非法 ID）：宽松忽略，不阻断转发
+			}
+			newAttID := idgen.GenerateID(idgen.PrefixMessage)
+			copiedAtts = append(copiedAtts, &model.MessageAttachment{
+				ID:          newAttID,
+				MessageID:   msgID,
+				Type:        src.Type,
+				FileName:    src.FileName,
+				FileSize:    src.FileSize,
+				MimeType:    src.MimeType,
+				FileURL:     fmt.Sprintf("/api/channel-files/%s", newAttID),
+				ThumbURL:    fmt.Sprintf("/api/channel-files/%s?thumb=1", newAttID),
+				Width:       src.Width,
+				Height:      src.Height,
+				CloudFileID: src.CloudFileID,
+			})
+		}
+		// 内容为空且一条有效源附件都没命中时，等价于空消息，拒绝创建。
+		if content == "" && len(copiedAtts) == 0 {
+			return nil, errors.ErrBadRequest.WithDetails("message content or attachments required")
+		}
+	}
+
 	msgType := s.messageTypeForAttachments(files)
+	if msgType == "text" {
+		// 无新上传文件、仅复制附件引用时，按源附件类型推导消息类型（image/video/file/mixed）。
+		msgType = messageTypeForCopiedAttachments(copiedAtts)
+	}
 	msg := &model.Message{
-		ID:        idgen.GenerateID(idgen.PrefixMessage),
+		ID:        msgID,
 		ChannelID: channelID,
 		UserID:    userID,
 		// username 已退役：作者快照字段统一存显示名（AuthorUsername 亦为显示名，读时仍按 UserID 解析）
@@ -530,6 +650,7 @@ func (s *Service) CreateMessage(channelID, userID, username, role, content, clie
 		AuthorRole:        role,
 		Content:           content,
 		Type:              msgType,
+		ForwardFrom:       forwardFrom,
 	}
 	if parentID = strings.TrimSpace(parentID); parentID != "" {
 		// 线程回复：保留与父消息的关联关系（PRD US-F04-3）。父消息存在性校验
@@ -573,6 +694,12 @@ func (s *Service) CreateMessage(channelID, userID, username, role, content, clie
 			return err
 		}
 		for _, att := range atts {
+			if err := tx.Create(att).Error; err != nil {
+				return err
+			}
+		}
+		// 转发复制的附件引用行（指向既有 CloudFileID）与新消息同事务落库
+		for _, att := range copiedAtts {
 			if err := tx.Create(att).Error; err != nil {
 				return err
 			}
@@ -766,6 +893,31 @@ func (s *Service) messageTypeForAttachments(files []*multipart.FileHeader) strin
 			hasFile = true
 		}
 	}
+	return combineAttachmentTypes(hasImage, hasVideo, hasFile)
+}
+
+// messageTypeForCopiedAttachments 与 messageTypeForAttachments 同族：基于「已存在的
+// 附件行类型」（转发复制附件引用场景）推导消息类型，组合规则保持一致。
+func messageTypeForCopiedAttachments(atts []*model.MessageAttachment) string {
+	if len(atts) == 0 {
+		return "text"
+	}
+	hasImage, hasVideo, hasFile := false, false, false
+	for _, a := range atts {
+		switch a.Type {
+		case "image":
+			hasImage = true
+		case "video":
+			hasVideo = true
+		default:
+			hasFile = true
+		}
+	}
+	return combineAttachmentTypes(hasImage, hasVideo, hasFile)
+}
+
+// combineAttachmentTypes 折算附件类别组合 → 消息 type（单类取单值，混类记 mixed）。
+func combineAttachmentTypes(hasImage, hasVideo, hasFile bool) string {
 	if hasImage && !hasVideo && !hasFile {
 		return "image"
 	}
@@ -801,6 +953,9 @@ const (
 	thumbMaxWidth      = 400
 	thumbQuality       = 80
 	compressedQuality  = 85
+	// maxForwardFromLen 转发来源显示名快照长度上限（字符数，与 model.Message 的
+	// gorm size:64 对齐）。只存显示名快照，不做引用联动。
+	maxForwardFromLen = 64
 )
 
 // processAttachment validates, archives and describes one uploaded file.
@@ -1039,7 +1194,7 @@ func (s *Service) loadMessageAttachments(msg *model.Message) (*model.Message, er
 
 // CreateMessageText creates a text-only message (backward compatible helper).
 func (s *Service) CreateMessageText(channelID, userID, username, role, content, clientMessageID string) (*model.Message, error) {
-	return s.CreateMessage(channelID, userID, username, role, content, clientMessageID, "", nil)
+	return s.CreateMessage(channelID, userID, username, role, content, clientMessageID, "", "", nil, nil)
 }
 
 // GetMessage retrieves a message by ID
@@ -1103,8 +1258,30 @@ func (s *Service) GetReactions(messageID string) ([]model.Reaction, error) {
 	return reactions, nil
 }
 
-// MarkChannelRead marks all messages in a channel as read for a user
+// MarkChannelRead marks all messages in a channel as read for a user.
+// A9 二期 R3：lastMessageID 若指向线程回复，水位回退到该回复之前最近的顶层消息；
+// 找不到符合条件的顶层消息时水位不变（不写零值），避免把频道未读整体拉回 0。
 func (s *Service) MarkChannelRead(userID, channelID, lastMessageID string) error {
+	lastMessageID = strings.TrimSpace(lastMessageID)
+	if lastMessageID != "" {
+		var msg model.Message
+		if err := s.db.Select("id, parent_id, created_at").First(&msg, "id = ?", lastMessageID).Error; err == nil {
+			if msg.ParentID != nil && *msg.ParentID != "" {
+				var fallback model.Message
+				err := s.db.Select("id").
+					Where("channel_id = ? AND parent_id IS NULL AND created_at <= ?", channelID, msg.CreatedAt).
+					Order("created_at DESC").First(&fallback).Error
+				if err != nil {
+					if err == gorm.ErrRecordNotFound {
+						return nil // 水位不变：线程回复之前没有顶层消息
+					}
+					return errors.ErrInternal
+				}
+				lastMessageID = fallback.ID
+			}
+		}
+	}
+
 	if err := s.db.Where("user_id = ? AND channel_id = ?", userID, channelID).Delete(&model.UserChannelRead{}).Error; err != nil {
 		return err
 	}
@@ -1121,73 +1298,269 @@ func (s *Service) MarkChannelRead(userID, channelID, lastMessageID string) error
 	return s.db.Create(read).Error
 }
 
-// UnreadInfo contains unread state for a user in a channel
-type UnreadInfo struct {
-	UnreadCount          int64  `json:"unreadCount"`
-	MentionCount         int64  `json:"mentionCount"`
-	FirstUnreadMessageID string `json:"firstUnreadMessageId"`
+// ThreadUnread 是线程维度的未读摘要（A9 二期，DES-20261029-01 §7.1）。
+type ThreadUnread struct {
+	ParentID string    `json:"parentId"`
+	Count    int64     `json:"count"`
+	LastAt   time.Time `json:"lastAt"`
 }
 
-// GetUnreadCount gets unread message info for a user in a channel
-func (s *Service) GetUnreadCount(userID, channelID string) (*UnreadInfo, error) {
-	info := &UnreadInfo{}
+// flexibleTime 兼容 SQLite 与 PostgreSQL 的时间聚合结果：
+// PostgreSQL 的 MAX(timestamp) 返回 time.Time，而 SQLite（glebarez/sqlite）以
+// TEXT 存储时间、MAX() 返回 string，直接 Scan 到 time.Time 会报
+// "unsupported Scan, storing driver.Value type string into type *time.Time"。
+type flexibleTime struct{ time.Time }
 
+var flexibleTimeLayouts = []string{
+	time.RFC3339Nano,
+	"2006-01-02 15:04:05.999999999-07:00",
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02 15:04:05",
+}
+
+func (ft *flexibleTime) Scan(value interface{}) error {
+	switch v := value.(type) {
+	case nil:
+		ft.Time = time.Time{}
+		return nil
+	case time.Time:
+		ft.Time = v
+		return nil
+	case string:
+		return ft.parse(v)
+	case []byte:
+		return ft.parse(string(v))
+	default:
+		return fmt.Errorf("flexibleTime: unsupported scan type %T", value)
+	}
+}
+
+// Value 让 flexibleTime 同时满足 driver.Valuer，GORM 才会把它当成标量字段
+// 而不是未知类型/关系字段（否则报 "invalid field found ... define a valid
+// foreign key for relations or implement the Valuer/Scanner interface"）。
+func (ft flexibleTime) Value() (driver.Value, error) {
+	if ft.IsZero() {
+		return nil, nil
+	}
+	return ft.Time, nil
+}
+
+func (ft *flexibleTime) parse(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		ft.Time = time.Time{}
+		return nil
+	}
+	for _, layout := range flexibleTimeLayouts {
+		if parsed, err := time.Parse(layout, raw); err == nil {
+			ft.Time = parsed
+			return nil
+		}
+	}
+	return fmt.Errorf("flexibleTime: cannot parse %q", raw)
+}
+
+// UnreadInfo contains unread state for a user in a channel
+type UnreadInfo struct {
+	UnreadCount          int64          `json:"unreadCount"`
+	MentionCount         int64          `json:"mentionCount"`
+	FirstUnreadMessageID string         `json:"firstUnreadMessageId"`
+	ThreadUnreads        []ThreadUnread `json:"threadUnreads"` // A9 二期：线程维度未读（旧客户端忽略未知字段）
+}
+
+// GetUnreadCount gets unread message info for a user in a channel.
+// A9 二期语义（DES §6.1）：
+//   - 频道未读 = 顶层消息（parent_id IS NULL）中 created_at > 频道水位（不排除本人，保持旧行为）；
+//   - 线程未读 = 该 parent_id 下 created_at > COALESCE(线程读位, 频道水位) 且非本人所发。
+func (s *Service) GetUnreadCount(userID, channelID string) (*UnreadInfo, error) {
+	info := &UnreadInfo{ThreadUnreads: []ThreadUnread{}}
+
+	// 频道水位：user_channel_reads 最后已读消息的 created_at；无记录或消息已删 = 零值时间。
+	var watermark time.Time
 	var lastRead model.UserChannelRead
 	err := s.db.Where("user_id = ? AND channel_id = ?", userID, channelID).First(&lastRead).Error
 	if err != nil {
 		if err != gorm.ErrRecordNotFound {
 			return nil, errors.ErrInternal
 		}
-		// No read record — all messages are unread, mention count is 0
-		var count int64
-		if err := s.db.Model(&model.Message{}).Where("channel_id = ?", channelID).Count(&count).Error; err != nil {
-			return nil, errors.ErrInternal
+	} else {
+		info.MentionCount = int64(lastRead.MentionCount)
+		var lastReadMsg model.Message
+		if err := s.db.Select("created_at").First(&lastReadMsg, "id = ?", lastRead.LastReadMessageID).Error; err == nil {
+			watermark = lastReadMsg.CreatedAt
 		}
-		info.UnreadCount = count
-		// Find first message in channel
-		var firstMsg model.Message
-		if err := s.db.Select("id").Where("channel_id = ?", channelID).Order("created_at ASC").First(&firstMsg).Error; err == nil {
-			info.FirstUnreadMessageID = firstMsg.ID
-		}
-		return info, nil
-	}
-	info.MentionCount = int64(lastRead.MentionCount)
-
-	// Find the created_at of the last read message
-	var lastReadMsg model.Message
-	if err := s.db.Select("created_at").First(&lastReadMsg, "id = ?", lastRead.LastReadMessageID).Error; err != nil {
-		// If last read message no longer exists, count all messages in the channel
-		var count int64
-		if err := s.db.Model(&model.Message{}).Where("channel_id = ?", channelID).Count(&count).Error; err != nil {
-			return nil, errors.ErrInternal
-		}
-		info.UnreadCount = count
-		// Find first message in channel
-		var firstMsg model.Message
-		if err := s.db.Select("id").Where("channel_id = ?", channelID).Order("created_at ASC").First(&firstMsg).Error; err == nil {
-			info.FirstUnreadMessageID = firstMsg.ID
-		}
-		return info, nil
 	}
 
-	var count int64
-	if err := s.db.Model(&model.Message{}).Where("channel_id = ? AND created_at > ?", channelID, lastReadMsg.CreatedAt).Count(&count).Error; err != nil {
+	// 频道未读：只统计顶层消息（线程回复不计入频道未读）。
+	channelUnreadQuery := func() *gorm.DB {
+		q := s.db.Model(&model.Message{}).Where("channel_id = ? AND parent_id IS NULL", channelID)
+		if !watermark.IsZero() {
+			q = q.Where("created_at > ?", watermark)
+		}
+		return q
+	}
+	if err := channelUnreadQuery().Count(&info.UnreadCount).Error; err != nil {
 		return nil, errors.ErrInternal
 	}
-	info.UnreadCount = count
-
-	// Find first unread message
-	if count > 0 {
+	if info.UnreadCount > 0 {
 		var firstUnread model.Message
-		if err := s.db.Select("id").Where("channel_id = ? AND created_at > ?", channelID, lastReadMsg.CreatedAt).Order("created_at ASC").First(&firstUnread).Error; err == nil {
+		if err := channelUnreadQuery().Select("id").Order("created_at ASC").First(&firstUnread).Error; err == nil {
 			info.FirstUnreadMessageID = firstUnread.ID
 		}
+	}
+
+	// 线程未读聚合：单条 SQL（禁 N+1），按 parent_id 分组，lastAt 倒序，最多 20 条。
+	type threadUnreadRow struct {
+		ParentID string
+		Cnt      int64
+		LastAt   flexibleTime
+	}
+	var rows []threadUnreadRow
+	if err := s.db.Table("messages AS m").
+		Select("m.parent_id AS parent_id, COUNT(*) AS cnt, MAX(m.created_at) AS last_at").
+		Joins("LEFT JOIN message_thread_reads AS tr ON tr.parent_id = m.parent_id AND tr.user_id = ?", userID).
+		Where("m.channel_id = ? AND m.parent_id IS NOT NULL AND m.user_id != ? AND m.deleted_at IS NULL", channelID, userID).
+		Where("m.created_at > COALESCE(tr.read_at, ?)", watermark).
+		Group("m.parent_id").
+		Order("last_at DESC").
+		Limit(20).
+		Scan(&rows).Error; err != nil {
+		return nil, errors.ErrInternal
+	}
+	for _, r := range rows {
+		info.ThreadUnreads = append(info.ThreadUnreads, ThreadUnread{ParentID: r.ParentID, Count: r.Cnt, LastAt: r.LastAt.Time})
 	}
 
 	return info, nil
 }
 
-// GetThread retrieves thread replies for a parent message
+// ThreadReadResult 线程已读写入结果（A9 二期 D-1 / S-01）。
+// Advanced=false 表示本次上报没有推进水位（重复上报同一回复，或 lastMessageId
+// 早于现有水位）；调用方此时不得广播清零事件，应返回 200 + "thread already read"。
+type ThreadReadResult struct {
+	LastReadMessageID string
+	Advanced          bool
+}
+
+// MarkThreadRead 记录用户在某线程上的已读位（A9 二期，DES §7.2）。
+// 校验失败统一返回 404 MESSAGE_NOT_FOUND（R2）：父消息不存在 / 不属于该频道 /
+// 该线程没有回复。只 upsert message_thread_reads，绝不删除或修改 user_channel_reads。
+//
+// 水位语义（D-1/S-01）：read_at 取「目标回复的 created_at」，不再用 time.Now()。
+// 客户端可能在 fetchThread 返回前就上报已读；若以上报时刻作水位，上报瞬间已存在
+// 但客户端尚未渲染的回复会被算作已读，导致未读被静默清零。
+// 单调性：read_at 只增不减（并发下由 upsert 的 CASE 保证原子性）；本次未推进水位时
+// 返回 Advanced=false，由 handler 决定「不广播、返回 thread already read」。
+func (s *Service) MarkThreadRead(userID, channelID, parentID, lastMessageID string) (*ThreadReadResult, error) {
+	notFound := errors.New(errors.MESSAGE_NOT_FOUND, "message not found")
+	var parent model.Message
+	if err := s.db.Select("id, channel_id, parent_id").First(&parent, "id = ?", parentID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, notFound
+		}
+		return nil, errors.ErrInternal
+	}
+	if parent.ChannelID != channelID {
+		return nil, notFound
+	}
+	var replies int64
+	if err := s.db.Model(&model.Message{}).Where("parent_id = ?", parentID).Count(&replies).Error; err != nil {
+		return nil, errors.ErrInternal
+	}
+	// 无可见回复（含回复已被全部删除/并发删除）同样按 R2 返回 404 MESSAGE_NOT_FOUND；
+	// 客户端打开抽屉时若收到 404，应回退为「线程不存在/已清空」并刷新主列表。
+	if replies == 0 {
+		return nil, notFound
+	}
+
+	// 解析目标回复：一条查询同时完成「取 created_at」与「归属校验」。
+	// 归属校验不可省（Low-1）：lastMessageId 若能指向同频道其它线程/顶层消息，
+	// 就能把本线程水位抬到更晚时间，从而误清本线程未读。
+	lastMessageID = strings.TrimSpace(lastMessageID)
+	var target model.Message
+	if lastMessageID != "" {
+		if err := s.db.Select("id, created_at").Where("id = ? AND parent_id = ?", lastMessageID, parentID).First(&target).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil, notFound
+			}
+			return nil, errors.ErrInternal
+		}
+	} else {
+		if err := s.db.Select("id, created_at").Where("parent_id = ?", parentID).Order("created_at DESC").First(&target).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil, notFound
+			}
+			return nil, errors.ErrInternal
+		}
+		lastMessageID = target.ID
+	}
+	watermarkAt := target.CreatedAt
+
+	// 水位未推进（重复上报同一回复 / 更早的 lastMessageId）：直接返回，
+	// 不写库也不广播，保证 read_at 与 last_read_message_id 均不回退。
+	var existing model.MessageThreadRead
+	switch err := s.db.Select("read_at", "last_read_message_id").
+		Where("user_id = ? AND parent_id = ?", userID, parentID).First(&existing).Error; {
+	case err == nil:
+		if !watermarkAt.After(existing.ReadAt) {
+			return &ThreadReadResult{LastReadMessageID: existing.LastReadMessageID, Advanced: false}, nil
+		}
+	case err == gorm.ErrRecordNotFound:
+		// 首次上报该线程：继续写入。
+	default:
+		return nil, errors.ErrInternal
+	}
+
+	row := &model.MessageThreadRead{
+		ID:                idgen.NextString(),
+		UserID:            userID,
+		ParentID:          parentID,
+		ChannelID:         channelID,
+		LastReadMessageID: lastMessageID,
+		ReadAt:            watermarkAt,
+	}
+	// 用 CASE 而非 GREATEST：SQLite 无 GREATEST，CASE 在 SQLite/PG 通用。
+	// 并发下两个上报可能都「未读到旧行」而通过上面的检查，CASE 保证最终落库值
+	// 仍单调（只增不减），last_read_message_id 与 updated_at 随水位同向更新。
+	err := s.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "parent_id"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"read_at":              gorm.Expr("CASE WHEN excluded.read_at > message_thread_reads.read_at THEN excluded.read_at ELSE message_thread_reads.read_at END"),
+			"last_read_message_id": gorm.Expr("CASE WHEN excluded.read_at > message_thread_reads.read_at THEN excluded.last_read_message_id ELSE message_thread_reads.last_read_message_id END"),
+			"updated_at":           gorm.Expr("CASE WHEN excluded.read_at > message_thread_reads.read_at THEN excluded.updated_at ELSE message_thread_reads.updated_at END"),
+		}),
+	}).Create(row).Error
+	if err != nil {
+		return nil, err
+	}
+	return &ThreadReadResult{LastReadMessageID: lastMessageID, Advanced: true}, nil
+}
+
+// ThreadReplyCounts 批量统计一组父消息的直接回复数（A9 二期 §7.7）。
+// 一次 GROUP BY 查询，禁止按消息逐条计数（N+1）。
+func (s *Service) ThreadReplyCounts(parentIDs []string) (map[string]int64, error) {
+	out := make(map[string]int64, len(parentIDs))
+	if len(parentIDs) == 0 {
+		return out, nil
+	}
+	type countRow struct {
+		ParentID string
+		Cnt      int64
+	}
+	var rows []countRow
+	if err := s.db.Table("messages AS m").
+		Select("m.parent_id AS parent_id, COUNT(*) AS cnt").
+		Where("m.parent_id IN ? AND m.deleted_at IS NULL", parentIDs).
+		Group("m.parent_id").
+		Scan(&rows).Error; err != nil {
+		return nil, errors.ErrInternal
+	}
+	for _, r := range rows {
+		out[r.ParentID] = r.Cnt
+	}
+	return out, nil
+} // GetThread retrieves thread replies for a parent message
 func (s *Service) GetThread(parentID string, limit int) ([]model.Message, bool, error) {
 	if limit < 1 || limit > 100 {
 		limit = 20

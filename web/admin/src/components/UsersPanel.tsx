@@ -201,7 +201,7 @@ export default function UsersPanel({
             <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}><Lock size={18} aria-hidden="true" /> 重置密码</h3>
             <p style={{ color: 'var(--text-secondary)', fontSize: 14, marginTop: 8 }}>为用户 <strong>{users.find(u => u.id === resetPasswordUser)?.username}</strong> 设置新密码，重置后该用户的所有登录会话将立即失效。</p>
             <div className="stat-box" style={{ marginTop: 12 }}>
-              <label className="stat-label" htmlFor="reset-new-password">新密码（至少 8 位）</label>
+              <label className="stat-label" htmlFor="reset-new-password">新密码（至少 12 位）</label>
               <input id="reset-new-password" className="auth-input" style={{ marginTop: 8, marginBottom: 0 }} type="password" placeholder="输入新密码" value={resetPasswordNew} onChange={e => setResetPasswordNew(e.target.value)} />
             </div>
             <div className="stat-box" style={{ marginTop: 12 }}>
@@ -212,7 +212,7 @@ export default function UsersPanel({
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
               <button className="track-btn" onClick={() => setResetPasswordUser(null)}>取消</button>
               <button className="track-btn" disabled={resetPasswordLoading} onClick={async () => {
-                if (resetPasswordNew.length < 8) { setResetPasswordError('密码至少需要 8 位'); return }
+                if (resetPasswordNew.length < 12) { setResetPasswordError('密码至少需要 12 位（服务端要求）'); return }
                 if (resetPasswordNew !== resetPasswordConfirm) { setResetPasswordError('两次输入的密码不一致'); return }
                 setResetPasswordLoading(true)
                 setResetPasswordError('')

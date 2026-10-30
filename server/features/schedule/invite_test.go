@@ -565,7 +565,7 @@ func TestReminderRecipientsWithInvites(t *testing.T) {
 // TestInviteEventsRouting 两条 WS 事件的收件人与 payload：
 // schedule_invite_updated → 全部受邀人；schedule_invite_responded → 创建者。
 func TestInviteEventsRouting(t *testing.T) {
-	_, _, db, space := setupInviteFixture(t)
+	h, _, db, space := setupInviteFixture(t)
 
 	event := seedEvent(t, db, space.ID, "路由会", "all", "user-1", time.Now().Add(24*time.Hour))
 	invites := []model.ScheduleEventInvite{
@@ -594,7 +594,7 @@ func TestInviteEventsRouting(t *testing.T) {
 	})
 
 	t.Run("updated payload 结构", func(t *testing.T) {
-		raw := buildInviteUpdatedMessage(event, invites)
+		raw := buildInviteUpdatedMessage(event, h.buildInviteInfos(invites))
 		var msg struct {
 			Type    string `json:"type"`
 			Payload struct {
@@ -602,8 +602,9 @@ func TestInviteEventsRouting(t *testing.T) {
 				Title    string `json:"title"`
 				StartsAt string `json:"startsAt"`
 				Invites  []struct {
-					UserID string `json:"userId"`
-					Status string `json:"status"`
+					UserID      string `json:"userId"`
+					DisplayName string `json:"displayName"`
+					Status      string `json:"status"`
 				} `json:"invites"`
 			} `json:"payload"`
 		}

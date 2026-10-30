@@ -61,13 +61,11 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 		players = []string{}
 	}
 
-	symbol := p.Symbol
-	if symbol == "" {
-		if len(players) > 0 && players[0] == userID {
-			symbol = "X"
-		} else {
-			symbol = "O"
-		}
+	// 棋子由服务端按座位裁决（players[0]=X、players[1]=O），
+	// 不信任客户端提交的 symbol —— 否则后手可提交 "X" 冒充先手连下两子/抢胜。
+	symbol := "O"
+	if len(players) > 0 && players[0] == userID {
+		symbol = "X"
 	}
 	board[p.Index] = symbol
 
@@ -93,7 +91,13 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 	newState := util.ShallowCopy(state)
 	newState["board"] = board
 	newState["currentPlayer"] = next
-	newState["winner"] = winnerID
+	if winnerID == "" && draw {
+		// 平局必须写成约定的 "draw" 标记：IsGameOver 只认 winner=="draw"，
+		// 否则满盘后房间会永久停在 playing、无历史、无计分。
+		newState["winner"] = "draw"
+	} else {
+		newState["winner"] = winnerID
+	}
 	newState["winLine"] = line
 	return newState, nil
 }

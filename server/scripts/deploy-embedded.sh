@@ -69,9 +69,23 @@ SERVER_DIR="$DEPLOY_DIR/server"
 WEB_DIR="$DEPLOY_DIR/web"
 STORAGE_DIR="$SERVER_DIR/storage"
 ENV_FILE="$SERVER_DIR/.env.production"
+# H-1（reviewer 20261029 审查）：在线构建产物名 `ridgericetalk`、离线包内交付名
+# `ridgericetalk-server`（build-offline-bundle.sh 只打后者）。两者都必须认，否则
+# --skip-build 路径（install-offline.sh 恒走此路）离线安装 100% 失败。
+# 具体取值在 Stage 4（构建/复用后端）结束时确定。
+SERVER_BIN=""
 
 PUBLIC_ADDRESS=""
 PUBLIC_ADDRESS_EXPLICIT=false
+# G-5（网络适配收口）：与 deploy-baremetal.sh 同口径的参数。
+# 全部默认空 / false —— 不传时生成的 .env 与改动前逐字节一致（可回滚）。
+PUBLIC_ADMIN_ADDRESS_ARG=""
+PUBLIC_LK_URL_ARG=""
+MIRROR_PRESET_ARG=""
+HTTP_PROXY_ARG=""
+HTTPS_PROXY_ARG=""
+NAT_MODE=false
+SYSTEM_PROXY=false
 PORT_API=8080
 PORT_ADMIN=9090
 PORT_LK_WS=7880
@@ -80,6 +94,11 @@ PORT_LK_UDP=7882
 FORCE=false
 SKIP_FRONTEND=false
 SKIP_BUILD=false
+# task-49（rc3 真机实测）：离线安装下 RRT_EMBEDDED_DEPS 默认 false —— 离线包自带/
+# 系统预置依赖，若仍让服务端启动期联网下载（FFmpeg/LiveKit/netease），无外网机器
+# 会卡在下载（进程活着但不监听 API）→ 健康检查 60s 超时 → 安装 RC=1。
+# 在线安装/开发者路径默认仍为 true（行为不变）。本开关仅用于离线场景显式放行下载。
+ALLOW_EMBEDDED_DEPS_DOWNLOAD=false
 # N28（DES-20261002-01 §3.4）：TURN 参数化开关（--enable-turn），**默认关**。
 # 本脚本不直接生成 livekit.yaml —— 服务端首次启动按 livekit/livekit.yaml.template
 # 渲染（文件已存在则跳过渲染）。开启时在部署树内的模板追加 turn 块（udp 3478），
@@ -100,7 +119,17 @@ RidgeRiceTalk 嵌入式依赖一键部署脚本（Linux/macOS）
 
 Options:
   --help                    显示此帮助
-  --public-address <url>    对外访问地址（可省略，自动探测；例如 http://123.45.67.89:8080）
+  --public-address <url>    对外访问地址（可省略，自动探测；例如 http://203.0.113.7:8080）
+  --public-admin-address <url> G-5：Admin 对外地址（默认不加入 CORS 白名单；显式给出才加，
+                            例如 NAT 下 Admin 外部端口与 API 不同时）
+  --public-lk-url <ws-url>  G-5：LiveKit 对外 WebSocket URL（默认 ws://127.0.0.1:<ws>，
+                            桌面端会把 localhost 重写为 API 主机；反代/独立域名场景显式给）
+  --mirror-preset <mode>    G-5：下载镜像预设 cn|global|auto（默认 auto，规则同 baremetal）
+  --http-proxy <url>        G-5：经代理出网（curl/npm/git 等，导出 http_proxy）
+  --https-proxy <url>       G-5：同上（HTTPS 流量，导出 https_proxy）
+  --nat                     G-5：NAT/端口映射模式（必须显式 --public-address；
+                            强制 use_external_ip=false 并打印端口映射清单）
+  --system-proxy            G-5：把代理注入系统包管理器（apt/dnf，默认关，不改软件源）
   --deploy-dir <path>       部署目录（默认 /opt/ridgericetalk）
   --port-api <port>         API 端口（默认 8080）
   --port-admin <port>       Admin 端口（默认 9090）
@@ -112,6 +141,9 @@ Options:
   --skip-frontend           跳过前端构建
   --skip-build              跳过后端构建（直接复制已有二进制）
   --force                   强制覆盖 .env.production
+  --allow-embedded-deps-download
+                            离线安装下仍允许服务端启动期联网下载依赖（默认禁止）。
+                            仅在确认目标机可出网时使用；否则无网机器会卡在下载。
 EOF
 }
 
@@ -122,6 +154,13 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --help) show_help; exit 0 ;;
         --public-address) PUBLIC_ADDRESS="$2"; PUBLIC_ADDRESS_EXPLICIT=true; shift 2 ;;
+        --public-admin-address) PUBLIC_ADMIN_ADDRESS_ARG="$2"; shift 2 ;;
+        --public-lk-url) PUBLIC_LK_URL_ARG="$2"; shift 2 ;;
+        --mirror-preset) MIRROR_PRESET_ARG="$2"; shift 2 ;;
+        --http-proxy) HTTP_PROXY_ARG="$2"; shift 2 ;;
+        --https-proxy) HTTPS_PROXY_ARG="$2"; shift 2 ;;
+        --nat) NAT_MODE=true; shift ;;
+        --system-proxy) SYSTEM_PROXY=true; shift ;;
         --deploy-dir) DEPLOY_DIR="$2"; shift 2 ;;
         --port-api) PORT_API="$2"; shift 2 ;;
         --port-admin) PORT_ADMIN="$2"; shift 2 ;;
@@ -132,6 +171,8 @@ while [[ $# -gt 0 ]]; do
         --skip-frontend) SKIP_FRONTEND=true; shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --force) FORCE=true; shift ;;
+        # task-49：离线安装默认关闭运行期依赖下载；显式允许下载需本人签字式开关。
+        --allow-embedded-deps-download) ALLOW_EMBEDDED_DEPS_DOWNLOAD=true; shift ;;
         *) fail "未知参数: $1"; show_help; exit 1 ;;
     esac
 done
@@ -152,6 +193,58 @@ if [[ "$PORT_LK_TCP" != "7881" ]] || [[ "$PORT_LK_UDP" != "7882" ]]; then
     warn "LiveKit 媒体端口由服务端固定为 7881(tcp)/7882(udp)，--port-lk-tcp/--port-lk-udp 仅影响 WS（$PORT_LK_WS 可配）与放行清单提示"
 fi
 
+# ============================================================
+# task-49（rc3 真机实测缺陷）：RRT_EMBEDDED_DEPS 落盘值解析
+# 离线安装（install-offline.sh 导出 RRT_OFFLINE=true）默认 false：离线包自带/
+# 系统预置依赖，若仍让服务端在启动期下载 FFmpeg/LiveKit/netease，无外网机器会
+# 卡在下载（进程活着但不监听 API）→ 健康检查 60s 超时 → 安装 RC=1。
+# 在线安装与开发者路径默认保持 true（行为不变）。
+# 优先级：显式 RRT_EMBEDDED_DEPS（true|false）> 离线默认 false > 在线默认 true。
+# ============================================================
+resolve_embedded_deps_value() {
+    local v="${RRT_EMBEDDED_DEPS:-}"
+    if [[ -n "$v" ]]; then
+        case "$v" in
+            true|false) printf '%s' "$v"; return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    if [[ "${RRT_OFFLINE:-false}" == "true" || "${RRT_OFFLINE:-false}" == "1" ]]; then
+        printf 'false'
+    else
+        printf 'true'
+    fi
+}
+
+# 离线安装 + 运行期依赖下载 = 矛盾组合：离线包不含 third_party/models/services
+# 依赖时，无网机器会静默卡在下载。此组合下 fail-fast 并给出补齐路径。
+assert_offline_embedded_deps_safe() {
+    local value="$1"
+    [[ "$value" == "true" ]] || return 0
+    if [[ "${RRT_OFFLINE:-false}" != "true" && "${RRT_OFFLINE:-false}" != "1" ]]; then
+        return 0
+    fi
+    if [[ "$ALLOW_EMBEDDED_DEPS_DOWNLOAD" == "true" ]]; then
+        info "离线安装但显式允许运行期依赖下载（--allow-embedded-deps-download）：请确认目标机可出网，否则服务端启动会卡在下载"
+        return 0
+    fi
+    local missing=()
+    [[ -d "$SERVER_DIR/third_party" ]] || missing+=("$SERVER_DIR/third_party（FFmpeg 等第三方依赖）")
+    [[ -d "$SERVER_DIR/models" ]] || missing+=("$SERVER_DIR/models（TTS 等模型）")
+    [[ -d "$DEPLOY_DIR/services/netease-api" ]] || missing+=("$DEPLOY_DIR/services/netease-api（网易云 API 服务）")
+    (( ${#missing[@]} == 0 )) && return 0
+    fail "离线安装下 RRT_EMBEDDED_DEPS=true 且缺少本地依赖：服务端会尝试联网下载，无网机器将卡死"
+    local m
+    for m in "${missing[@]}"; do
+        fail "  缺失: $m"
+    done
+    fail "修复（三选一）："
+    fail "  ① 推荐：不要显式设置 RRT_EMBEDDED_DEPS，离线安装默认即 false（不下载）"
+    fail "  ② 把上述依赖放到对应目录（离线包可用 build-offline-bundle.sh 重新构建携带）"
+    fail "  ③ 确认目标机可出网时，加 --allow-embedded-deps-download 重新执行"
+    return 1
+}
+
 # --public-address 可省略（DES-2026-0912-03 §5.3 短板③）：
 # 未显式提供时探测公网/本机 IP 作为默认值，交互终端下询问确认，
 # 非交互场景（CI、SSH 管道）直接采用默认值 —— 绝不读 /dev/tty，
@@ -161,6 +254,40 @@ fi
 if [[ -f "$SCRIPT_DIR/lib/net.sh" ]]; then
     # shellcheck source=/dev/null
     source "$SCRIPT_DIR/lib/net.sh"
+fi
+# G-5 网络适配（2026-10-07 阿里云 RHEL 真机实证）：国内 VPS 上 go 默认走
+# proxy.golang.org（被墙）会无限期卡死在模块下载。默认补 GOPROXY=goproxy.cn；
+# 海外/已有代理环境设 RRT_GOPROXY=off 跳过，或 RRT_GOPROXY=<url> 覆盖。
+if [[ -z "${GOPROXY:-}" && "${RRT_GOPROXY:-}" != "off" ]]; then
+    export GOPROXY="${RRT_GOPROXY:-https://goproxy.cn,direct}"
+fi
+# G-5：镜像预设（cn|global|auto）——与 baremetal 同口径，数据表在 lib/mirrors.sh；
+# 本脚本的下载点（Go/Node/LiveKit/GitHub/npm）统一读 rrt_mirror_preset。
+if [[ -n "${MIRROR_PRESET_ARG}" ]]; then
+    if declare -F rrt_mirror_preset_valid &>/dev/null && ! rrt_mirror_preset_valid "$MIRROR_PRESET_ARG"; then
+        fail "--mirror-preset 仅支持 cn|global|auto（当前: $MIRROR_PRESET_ARG）"
+        exit 2
+    fi
+    RRT_MIRROR_PRESET="$MIRROR_PRESET_ARG"
+    info "镜像预设: $RRT_MIRROR_PRESET"
+fi
+# G-5：代理参数 → 标准环境变量（与 baremetal 同口径：小写优先，兼顾大写变体）
+if [[ -n "${HTTP_PROXY_ARG}" ]]; then
+    export http_proxy="$HTTP_PROXY_ARG" HTTP_PROXY="$HTTP_PROXY_ARG"
+    info "已设置代理: http_proxy=$HTTP_PROXY_ARG"
+fi
+if [[ -n "${HTTPS_PROXY_ARG}" ]]; then
+    export https_proxy="$HTTPS_PROXY_ARG" HTTPS_PROXY="$HTTPS_PROXY_ARG"
+    info "已设置代理: https_proxy=$HTTPS_PROXY_ARG"
+fi
+# G-5：--system-proxy → 注入 apt/dnf 代理（默认关；失败只告警，不中止部署）
+if [[ "$SYSTEM_PROXY" == "true" ]]; then
+    if declare -F rrt_apply_system_proxy &>/dev/null; then
+        RRT_DRY_RUN="${DRY_RUN:-false}" rrt_apply_system_proxy "${HTTP_PROXY_ARG}" "${HTTPS_PROXY_ARG}" \
+            || warn "系统包管理器代理注入失败（已忽略，继续部署；可手动配置 apt/dnf 代理）"
+    else
+        warn "能力层缺少 rrt_apply_system_proxy，跳过系统代理注入"
+    fi
 fi
 if [[ -z "$PUBLIC_ADDRESS" ]]; then
     DETECTED_IP=""
@@ -219,6 +346,26 @@ if [[ "$PUBLIC_ADDRESS_EXPLICIT" != "true" ]]; then
     # 未显式指定：探测到的「IP」可能是内网网卡地址（公网探测失败时回退 hostname -I），
     # 无法确认真有公网出口 → 保守关闭
     LK_USE_EXTERNAL_IP="false"
+fi
+
+# G-5：--nat 模式收口。NAT 后本机网卡上没有公网地址，自动探测不可靠 →
+# 必须显式 --public-address；use_external_ip 一律 false；并打印端口映射清单。
+if [[ -n "$PUBLIC_LK_URL_ARG" && "$PUBLIC_LK_URL_ARG" != ws://* && "$PUBLIC_LK_URL_ARG" != wss://* ]]; then
+    fail "--public-lk-url 必须以 ws:// 或 wss:// 开头：$PUBLIC_LK_URL_ARG"
+    exit 2
+fi
+if [[ "$NAT_MODE" == "true" ]]; then
+    if [[ "$PUBLIC_ADDRESS_EXPLICIT" != "true" ]]; then
+        fail "--nat 需要显式 --public-address <对外URL>（NAT 下自动探测不可靠）"
+        exit 2
+    fi
+    LK_USE_EXTERNAL_IP="false"
+    info "--nat 模式：use_external_ip=false。需在路由器/云安全组逐条映射并放通："
+    printf '    API         %s/tcp\n' "$PORT_API"
+    printf '    Admin       %s/tcp\n' "$PORT_ADMIN"
+    printf '    LiveKit WS  %s/tcp\n' "$PORT_LK_WS"
+    printf '    LiveKit TCP %s/tcp（服务端固定，必须 1:1）\n' "$PORT_LK_TCP"
+    printf '    LiveKit UDP %s/udp（服务端固定，必须 1:1）\n' "$PORT_LK_UDP"
 fi
 
 TOTAL_STAGES=7
@@ -502,6 +649,20 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
         fail "未找到 C 编译器(gcc/cc)：音乐机器人 opus 编码硬依赖 CGO，请先安装 build-essential"
         exit 1
     fi
+    # RHEL 真机缺口（2026-10-07 阿里云实证）：embedded 此前只检不装 opus 开发库，
+    # 全新 RHEL 机器上 CGO 编译必挂「Package 'opus', required by 'virtual:world',
+    # not found」。检测缺失时经 lib/pkg.sh 映射自动安装（libopus-dev→opus-devel 等）。
+    if ! pkg-config --exists opus 2>/dev/null || ! pkg-config --exists opusfile 2>/dev/null; then
+        info "opus/opusfile 开发库缺失（音乐机器人 CGO 依赖），尝试自动安装…"
+        if [[ -f "$SCRIPT_DIR/lib/pkg.sh" ]]; then
+            # shellcheck source=/dev/null
+            source "$SCRIPT_DIR/lib/pkg.sh"
+            rrt_pkg_install libopus-dev libopusfile-dev || \
+                warn "opus 开发库自动安装失败——请手动安装（Debian: libopus-dev libopusfile-dev；RHEL: opus-devel opusfile-devel）"
+        else
+            warn "lib/pkg.sh 不可用——请手动安装 opus/opusfile 开发库后再试"
+        fi
+    fi
     # BUILD_LDFLAGS 含空格，必须整体作为 -ldflags 的单个参数传递
     # （教训：unquoted 展开会让 -X 直达 go 顶层参数，报 "flag provided but not defined: -X"）
     #
@@ -514,7 +675,8 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
         go build -buildvcs=false -o ridgericetalk.new ./cmd/server
     fi
     mv -f ridgericetalk.new ridgericetalk
-    ok "Backend built: $SERVER_DIR/ridgericetalk（已原子换装；重启服务后生效）"
+    SERVER_BIN="$SERVER_DIR/ridgericetalk"
+    ok "Backend built: $SERVER_BIN（已原子换装；重启服务后生效）"
 
     # 迁移工具随主二进制一起构建（对齐 deploy-baremetal.sh 编译先例）；
     # 刚编译的产物必为本机格式，无需 baremetal 的 ELF magic 校验
@@ -528,11 +690,28 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     ok "Migration tool built: $SERVER_DIR/ridgericetalk-migrate"
 else
     stage "$BUILD_STAGE" "$TOTAL_STAGES" "Skipping backend build"
-    if [[ ! -f "$SERVER_DIR/ridgericetalk" ]]; then
-        fail "No existing binary at $SERVER_DIR/ridgericetalk and --skip-build requested"
+    # H-1：离线包内是 ridgericetalk-server，在线产物是 ridgericetalk —— 依次探测。
+    for _cand in "$SERVER_DIR/ridgericetalk" "$SERVER_DIR/ridgericetalk-server"; do
+        if [[ -f "$_cand" ]]; then
+            SERVER_BIN="$_cand"
+            break
+        fi
+    done
+    # 在 Windows 上打包（git-bash/NTFS）时 chmod 不落盘，tar 内可能记录 0644 →
+    # Linux 解包后不可执行。这里补一次 +x，避免「文件在但起不来」的隐蔽失败。
+    if [[ -n "$SERVER_BIN" && ! -x "$SERVER_BIN" ]]; then
+        chmod +x "$SERVER_BIN" 2>/dev/null || true
+        # P1-2（reviewer 20261029）：chmod 后必须校验 -x，不能只靠 `|| true` 就当成功
+        # （NTFS 实测：chmod 返回 0 但 mode 仍 0644，随后启动静默失败）。
+        if [[ ! -x "$SERVER_BIN" ]]; then
+            fail "无法为 $SERVER_BIN 设置可执行位（目标文件系统可能 noexec 挂载或权限不足）"
+        fi
+    fi
+    if [[ -z "$SERVER_BIN" ]]; then
+        fail "No existing binary at $SERVER_DIR/ridgericetalk or $SERVER_DIR/ridgericetalk-server and --skip-build requested"
         exit 1
     fi
-    ok "Using existing binary: $SERVER_DIR/ridgericetalk"
+    ok "Using existing binary: $SERVER_BIN"
 fi
 
 # ============================================================
@@ -566,6 +745,29 @@ else
     case "$PUBLIC_ADDRESS" in
         https://*|wss://*) CORS_LOCAL_SCHEME="https" ;;
     esac
+    # G-5：CORS 白名单。默认与改动前逐字节一致（PUBLIC_ADDRESS + localhost 双端口）；
+    # 仅显式 --public-admin-address 时追加 Admin 对外地址（NAT 外部端口不同场景）。
+    if [[ -n "${PUBLIC_ADMIN_ADDRESS_ARG}" ]]; then
+        CORS_PUBLIC_VALUE="$PUBLIC_ADDRESS,$PUBLIC_ADMIN_ADDRESS_ARG,${CORS_LOCAL_SCHEME}://localhost:$PORT_API,${CORS_LOCAL_SCHEME}://localhost:$PORT_ADMIN"
+    else
+        CORS_PUBLIC_VALUE="$PUBLIC_ADDRESS,${CORS_LOCAL_SCHEME}://localhost:$PORT_API,${CORS_LOCAL_SCHEME}://localhost:$PORT_ADMIN"
+    fi
+    # G-5：LiveKit 对外 WS URL。默认保持 ws://127.0.0.1:<ws>（嵌入式单机口径：
+    # 桌面端会把 localhost/127.0.0.1 重写为 API 主机，见 ridgericetalk-win
+    # voiceStore/rewriteLiveKitUrl + remoteAssistViewer.rewriteAssistLiveKitUrl），
+    # 仅 --public-lk-url 显式给出才覆盖 → 老部署生成物逐字节不变。
+    if [[ -n "${PUBLIC_LK_URL_ARG}" ]]; then
+        LK_PUBLIC_URL_VALUE="$PUBLIC_LK_URL_ARG"
+    else
+        LK_PUBLIC_URL_VALUE="ws://127.0.0.1:$PORT_LK_WS"
+    fi
+
+    # task-49：离线安装默认 false（不联网下载依赖），在线/开发者默认 true。
+    EMBEDDED_DEPS_VALUE="$(resolve_embedded_deps_value)" || {
+        fail "RRT_EMBEDDED_DEPS 取值非法（只接受 true/false）：${RRT_EMBEDDED_DEPS:-}"
+        exit 1
+    }
+    assert_offline_embedded_deps_safe "$EMBEDDED_DEPS_VALUE" || exit 1
 
     cat > "$ENV_FILE" <<EOF
 # RidgeRiceTalk 生产环境配置（由 deploy-embedded.sh 自动生成）
@@ -579,7 +781,7 @@ RRT_PUBLIC_ADDRESS=$PUBLIC_ADDRESS
 RRT_PORT=$PORT_API
 RRT_ADMIN_PORT=$PORT_ADMIN
 
-RRT_CORS_ORIGINS=$PUBLIC_ADDRESS,${CORS_LOCAL_SCHEME}://localhost:$PORT_API,${CORS_LOCAL_SCHEME}://localhost:$PORT_ADMIN
+RRT_CORS_ORIGINS=$CORS_PUBLIC_VALUE
 
 RRT_DATABASE_URL=$STORAGE_DIR/ridgericetalk.db
 RRT_DB_DRIVER=sqlite
@@ -588,14 +790,16 @@ RRT_JWT_SECRET=$JWT_SECRET
 RRT_CSRF_TOKEN_SECRET=$CSRF_SECRET
 RRT_ENCRYPTION_KEY=
 
-RRT_EMBEDDED_DEPS=true
+# task-49：离线安装默认关闭服务端启动期依赖下载（离线包/系统已预置 deps）；
+# 在线安装默认 true。无外网机器请勿改回 true —— 服务端会卡在下载且不监听 API。
+RRT_EMBEDDED_DEPS=$EMBEDDED_DEPS_VALUE
 RRT_THIRD_PARTY_DIR=$SERVER_DIR/third_party
 RRT_MODELS_DIR=$SERVER_DIR/models
 
 RRT_LIVEKIT_AUTOSTART=true
 RRT_LIVEKIT_PORT=$PORT_LK_WS
 RRT_LIVEKIT_URL=ws://127.0.0.1:$PORT_LK_WS
-RRT_LIVEKIT_PUBLIC_URL=ws://127.0.0.1:$PORT_LK_WS
+RRT_LIVEKIT_PUBLIC_URL=$LK_PUBLIC_URL_VALUE
 RRT_LIVEKIT_API_KEY=$LK_API_KEY
 RRT_LIVEKIT_API_SECRET=$LK_API_SECRET
 RRT_NETEASE_API_ENDPOINT=http://127.0.0.1:3300
@@ -725,6 +929,12 @@ if [[ -f "$_BUILTIN_LK" ]] && [[ ! -f "$_TK_LK_DIR/livekit-server" ]]; then
 elif [[ -f "$_TK_LK_DIR/livekit-server" ]]; then
     ok "LiveKit 已就位: $_TK_LK_DIR/livekit-server"
 else
+    # 离线安装（install-offline.sh 会导出 RRT_OFFLINE=true）没有外网可下载，
+    # 缺内置 LiveKit 必须直接失败，而不是「先装好再等运行时静默降级」（M-1）。
+    if [[ "${RRT_OFFLINE:-false}" == "true" || "${RRT_OFFLINE:-false}" == "1" ]]; then
+        fail "离线模式要求包内自带 LiveKit，但 $PROJECT_DIR/livekit/bin/linux-$_lk_arch/livekit-server 不存在"
+        exit 1
+    fi
     warn "仓库无内置 LiveKit 离线物（$_BUILTIN_LK 不存在），服务端将尝试联网下载"
 fi
 
@@ -759,10 +969,24 @@ fi
 # SQLite 走 GORM AutoMigrate 兜底（cmd/migrate 仅支持 up，无 down）。
 # 连接经环境变量传入（见 cmd/migrate/main.go 头部 Environment 说明）。
 MIGRATE_BIN="$SERVER_DIR/ridgericetalk-migrate"
+# H-2：服务端按相对路径 ../migrations 找版本化 SQL（migrate_versioned.go MatsDir）。
+# 离线包现在自带 migrations/，但老包/手工同步可能缺 —— 缺了必须显式提示，
+# 否则只看到一句「迁移失败」无从排查。
+if [[ ! -d "$DEPLOY_DIR/migrations" ]]; then
+    warn "未找到迁移目录: $DEPLOY_DIR/migrations（离线包应含 migrations/；可用 RRT_MIGRATIONS_PATH 指向包内目录）"
+fi
+if [[ -f "$MIGRATE_BIN" && ! -x "$MIGRATE_BIN" ]]; then
+    chmod +x "$MIGRATE_BIN" 2>/dev/null || true
+fi
 if [[ ! -x "$MIGRATE_BIN" ]]; then
-    # --skip-build 且首次部署时迁移工具可能缺失：就地补编译
-    # （baremetal ensure_migrate_binary 的轻量版；刚编译产物必为本机格式，
-    #   故不做 ELF magic 校验）
+    # H-4：离线包应自带迁移器；--skip-build（install-offline.sh 恒用）下目标机没有
+    # Go 工具链，就地补编译必以「go: command not found」惨败 —— 直接给可读错误。
+    if [[ "$SKIP_BUILD" == "true" ]]; then
+        fail "迁移器不可用: $MIGRATE_BIN（离线包应包含 ridgericetalk-migrate；请用新版 build-offline-bundle.sh 重新打包）"
+        exit 1
+    fi
+    # 在线模式下就地补编译（baremetal ensure_migrate_binary 的轻量版；刚编译产物
+    # 必为本机格式，故不做 ELF magic 校验）
     warn "迁移工具不存在: $MIGRATE_BIN，尝试补编译..."
     (cd "$SERVER_DIR" && go build -buildvcs=false -o ridgericetalk-migrate ./cmd/migrate/) || {
         fail "迁移工具编译失败，无法执行数据库迁移"
@@ -829,7 +1053,7 @@ if [[ ! -f "$PID_FILE" ]]; then
     # shellcheck source=/dev/null
     source "$ENV_FILE"
     set +a
-    nohup "$SERVER_DIR/ridgericetalk" > "$LOG_FILE" 2>&1 &
+    nohup "$SERVER_BIN" > "$LOG_FILE" 2>&1 &
     SERVER_PID=$!
     echo "$SERVER_PID" > "$PID_FILE"
     ok "Server started (pid $SERVER_PID, pid file: $PID_FILE)"
@@ -907,7 +1131,7 @@ fi
 banner "RidgeRiceTalk Embedded Deployment Ready"
 
 echo -e "  ${C_WHITE}Deploy directory:${C_RESET}  $DEPLOY_DIR"
-echo -e "  ${C_WHITE}Server binary:${C_RESET}     $SERVER_DIR/ridgericetalk"
+echo -e "  ${C_WHITE}Server binary:${C_RESET}     ${SERVER_BIN:-$SERVER_DIR/ridgericetalk}"
 echo -e "  ${C_WHITE}Public address:${C_RESET}    $PUBLIC_ADDRESS"
 echo -e "  ${C_WHITE}API port:${C_RESET}          $PORT_API"
 echo -e "  ${C_WHITE}Admin port:${C_RESET}        $PORT_ADMIN"
@@ -948,6 +1172,28 @@ else
     echo -e "    Token 当前不可读或尚未生成（服务首启时写入），查看: ${C_GREEN}sudo cat $STORAGE_DIR/.bootstrap_token${C_RESET}"
 fi
 echo ""
+
+# M2 观测性：nohup 方式下 server.log 无界增长 —— 尽力安装 logrotate 轮转
+# （systemd/journald 部署不受影响；非 root 时给出手工配置指引）。
+if [[ ! -d /etc/systemd/system/ridgericetalk.service.d ]] && ! systemctl cat ridgericetalk >/dev/null 2>&1; then
+    if [[ -d /etc/logrotate.d ]] && [[ "$(id -u)" == "0" ]]; then
+        cat > /etc/logrotate.d/ridgericetalk <<EOF
+$SERVER_DIR/logs/*.log {
+    daily
+    rotate 7
+    maxsize 100M
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+        ok "已配置日志轮转（/etc/logrotate.d/ridgericetalk：daily + 100M 上限，保留 7 份）"
+    else
+        info "日志轮转：服务日志位于 $SERVER_DIR/logs/（nohup 方式无自动轮转）。建议配置 logrotate："
+        info "  $SERVER_DIR/logs/*.log { daily; rotate 7; maxsize 100M; compress; copytruncate }"
+    fi
+fi
 
 # Optionally print reminder about firewall
 if command -v ufw &>/dev/null || command -v firewall-cmd &>/dev/null || command -v iptables &>/dev/null; then

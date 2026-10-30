@@ -144,8 +144,19 @@ rrt_public_ip() {
 rrt_is_private_host() {
     local host="${1:-}"
     [[ -n "$host" ]] || return 1
+    # G-5：容忍方括号形式（[2001:db8::1] / [::1]），先归一化再判定
+    host="${host#\[}"; host="${host%\]}"
     case "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" in
         localhost|localhost.|::1) return 0 ;;
+    esac
+    # G-5：IPv6 私网段（fc00::/7 唯一本地、fe80::/10 链路本地）按私网处理；
+    # 公网 IPv6（2001:db8:: 等）仍走 use_external_ip=true。
+    case "$host" in
+        *:*)
+            case "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" in
+                fc*|fd*|fe8*|fe9*|fea*|feb*) return 0 ;;
+            esac
+            return 1 ;;
     esac
     # 非 IP 字面量（域名）→ 非私网
     rrt_is_ip_like "$host" || return 1
@@ -162,12 +173,60 @@ rrt_is_private_host() {
 }
 
 # 从 URL/地址串提取 host 部分（供部署脚本推导用）：
-#   http://1.2.3.4:8080      → 1.2.3.4
-#   https://example.com/     → example.com
-#   192.168.1.10             → 192.168.1.10（裸 IP 原样）
+#   http://1.2.3.4:8080       → 1.2.3.4
+#   https://example.com/      → example.com
+#   http://[2001:db8::1]:8080 → 2001:db8::1（G-5：IPv6 方括号须先整体取出）
+#   192.168.1.10              → 192.168.1.10（裸 IP 原样）
+# 说明：旧实现用 `s#[/:?#].*$##` 一次性剥离，对带方括号的 IPv6 会截成 "[2001"
+# （G-5 所列「IPv6 方括号」缺陷），故改为显式分支处理。
 rrt_host_of_address() {
     local addr="${1:-}"
-    printf '%s' "$addr" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#[/:?#].*$##'
+    # 去 scheme（无 scheme 时原样保留）
+    case "$addr" in
+        *://*) addr="${addr#*://}" ;;
+    esac
+    # 去认证段（user:pass@host）
+    addr="${addr##*@}"
+    # IPv6 方括号：整体取出括号内地址，之后再无端口/路径可剥
+    case "$addr" in
+        \[*)
+            addr="${addr#\[}"
+            printf '%s\n' "${addr%%\]*}"
+            return 0
+            ;;
+    esac
+    printf '%s\n' "${addr%%[/:?#]*}"
+}
+
+# 把 host 转成「可安全嵌入 URL」的形式（G-5 IPv6 方括号）：
+#   2001:db8::1 → [2001:db8::1]；1.2.3.4 / example.com / [::1] 原样返回。
+# 用途：拼 RRT_CORS_ORIGINS、RRT_LIVEKIT_PUBLIC_URL 等 URL 时禁止直接插裸 IPv6
+# （否则 `ws://2001:db8::1:7880` 无法解析，G-5 IPv6 方括号明确项）。
+rrt_url_host() {
+    local host="${1:-}"
+    case "$host" in
+        \[*\]) printf '%s\n' "$host"; return 0 ;;   # 已是方括号形式
+        *:*)   printf '[%s]\n' "$host"; return 0 ;; # 裸 IPv6 字面量补方括号
+        *)     printf '%s\n' "$host"; return 0 ;;
+    esac
+}
+
+# 从 URL 中取端口（G-5 NAT：对外端口可≠监听端口）：
+#   http://1.2.3.4:50100 → 50100；https://example.com → 空（默认 443/80）
+rrt_port_of_address() {
+    local addr="${1:-}" rest
+    case "$addr" in
+        *://*) addr="${addr#*://}" ;;
+    esac
+    rest="${addr#*@}"
+    case "$rest" in
+        \[*\])  printf '' ; return 0 ;;   # [v6] 后若无 :port 则无端口
+        \[*\]:*) rest="${rest#*\]}" ;;
+    esac
+    case "$rest" in
+        *:*) printf '%s\n' "${rest##*:}" | sed -E 's#[/?#].*$##' ;;
+        *)   printf '' ;;
+    esac
 }
 
 # 按对外地址推导 LiveKit rtc.use_external_ip（FIX-20261003-01 A1 唯一裁决点）：
@@ -185,11 +244,11 @@ rrt_derive_use_external_ip() {
 }
 
 # ============================================================
-# 六、镜像预设（占位；P3「网络适配」才真正接入各下载点）
+# 六、镜像预设（G-5 已实装：数据表在 lib/mirrors.sh）
 # ============================================================
-# 现状：Go / Node / LiveKit / GitHub 加速 / npm 的镜像列表仍各自硬编码在
-# deploy-baremetal.sh 里，本组函数只提供**统一取值入口**，P3 把它们挪到一处。
-# 取值：cn（国内镜像优先）| global（直连上游）| auto（自动，默认，保持现状回退顺序）
+# 取值：cn（国内镜像优先）| global（直连上游）| auto（自动，默认，保持既有回退顺序）
+# 消费点：deploy-baremetal.sh / deploy-embedded.sh 的全部下载（Go/Node/LiveKit/
+# GitHub 加速/npm），具体 URL 优先序见 lib/mirrors.sh。
 rrt_mirror_preset() { printf '%s\n' "${RRT_MIRROR_PRESET:-auto}"; }
 
 rrt_mirror_preset_valid() {
@@ -207,5 +266,81 @@ rrt_set_mirror_preset() {
         return 1
     fi
     RRT_MIRROR_PRESET="$v"
+    return 0
+}
+
+# ============================================================
+# 七、系统包管理器代理注入（G-5「apt 代理注入」）
+# ============================================================
+# 边界：本组函数**只写代理**（apt.conf.d / dnf.conf 的 proxy=），**不换系统源**；
+# 系统源自动切换仍是 G-5b 未做项（与 mirrors.sh 头注释同口径）。
+# 调用时机：部署脚本 --system-proxy 且已给 --http-proxy/--https-proxy 时，在
+# 安装系统依赖之前调用；失败不中止部署（只告警，避免受限网络整链卡死）。
+# 幂等：apt 覆盖写同一文件；dnf 有 proxy= 行则替换、无则追加。
+rrt_apply_system_proxy() {
+    local http_proxy_arg="${1:-}" https_proxy_arg="${2:-}"
+    [[ -n "$http_proxy_arg" || -n "$https_proxy_arg" ]] || return 0
+    local proxy="${https_proxy_arg:-$http_proxy_arg}"
+    # M-4（reviewer 20261029 审查）：代理串会被明文写进系统配置文件。
+    # 含换行可注入额外配置行、含双引号会破坏 apt.conf 语法 —— 直接拒绝。
+    if [[ "$proxy" == *$'\n'* || "$proxy" == *'"'* ]]; then
+        printf '代理地址含非法字符（换行/双引号），拒绝写入系统配置: %s\n' "$proxy"
+        return 1
+    fi
+    local pm=""
+    if declare -F rrt_pkg_manager &>/dev/null; then
+        pm="$(rrt_pkg_manager 2>/dev/null || true)"
+    fi
+    case "$pm" in
+        apt)
+            local f=/etc/apt/apt.conf.d/99rrt-proxy
+            if [[ "${RRT_DRY_RUN:-false}" == "true" ]]; then
+                printf '[dry-run] 将写入 %s（http/https Proxy=%s，umask 077 → 0600）\n' "$f" "$proxy"
+                return 0
+            fi
+            # umask 077：代理 URL 可能带 user:pass@ 凭据，配置文件不得 0644 可读
+            if ( umask 077 && printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' \
+                    "$proxy" "$proxy" > "$f" ) 2>/dev/null; then
+                chmod 600 "$f" 2>/dev/null || true
+                printf 'apt 代理已注入: %s（0600）\n' "$f"
+            else
+                printf 'apt 代理注入失败（无权限？跳过）: %s\n' "$f"
+                return 1
+            fi
+            ;;
+        dnf)
+            local f=/etc/dnf/dnf.conf
+            if [[ "${RRT_DRY_RUN:-false}" == "true" ]]; then
+                printf '[dry-run] 将向 %s 写入 proxy=%s\n' "$f" "$proxy"
+                return 0
+            fi
+            # 用「临时文件重建」而非 sed -i 替换：proxy 串含 # & \ 时 sed 会改坏配置，
+            # 且旧 proxy= 行残留时只做 grep -q 判定会误报成功（M-4）。
+            local tmpf n
+            tmpf="$(mktemp "${f}.rrt.XXXXXX" 2>/dev/null || true)"
+            if [[ -z "$tmpf" ]]; then
+                printf 'dnf 代理注入失败（无法创建临时文件）: %s\n' "$f"
+                return 1
+            fi
+            { grep -v '^proxy=' "$f" 2>/dev/null || true; } > "$tmpf"
+            printf 'proxy=%s\n' "$proxy" >> "$tmpf"
+            if cat "$tmpf" > "$f" 2>/dev/null; then
+                rm -f "$tmpf" 2>/dev/null || true
+                n=$(grep -c '^proxy=' "$f" 2>/dev/null || true)
+                if [[ "${n:-0}" == "1" ]]; then
+                    printf 'dnf 代理已注入: %s\n' "$f"
+                    return 0
+                fi
+            else
+                rm -f "$tmpf" 2>/dev/null || true
+            fi
+            printf 'dnf 代理注入失败（无权限？跳过）: %s\n' "$f"
+            return 1
+            ;;
+        *)
+            # apk/未知包管理器：只依赖 http_proxy 环境变量（alpine 的 apk 读该变量）
+            return 0
+            ;;
+    esac
     return 0
 }

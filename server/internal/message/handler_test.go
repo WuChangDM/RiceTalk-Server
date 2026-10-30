@@ -102,7 +102,7 @@ func TestHandlerCreateMessage(t *testing.T) {
 		cfg := config.DefaultConfig()
 		handler := NewHandler(db, cfg, nil, nil)
 
-		parent, err := handler.service.CreateMessage("ch-1", "user-1", "testuser", middleware.RoleMember, "parent", idgen.NextString(), "", nil)
+		parent, err := handler.service.CreateMessage("ch-1", "user-1", "testuser", middleware.RoleMember, "parent", idgen.NextString(), "", "", nil, nil)
 		if err != nil {
 			t.Fatalf("failed to create parent: %v", err)
 		}
@@ -149,7 +149,7 @@ func TestHandlerGetMessages(t *testing.T) {
 		// Create some messages
 		channelID := "ch-1"
 		for i := 0; i < 15; i++ {
-			_, err := handler.service.CreateMessage(channelID, "user-1", "testuser", middleware.RoleMember, "msg"+idgen.NextString(), idgen.NextString(), "", nil)
+			_, err := handler.service.CreateMessage(channelID, "user-1", "testuser", middleware.RoleMember, "msg"+idgen.NextString(), idgen.NextString(), "", "", nil, nil)
 			if err != nil {
 				t.Fatalf("failed to create message: %v", err)
 			}
@@ -508,4 +508,149 @@ func TestHandlerMarkChannelRead(t *testing.T) {
 	if resp.Data.UnreadCount != 0 {
 		t.Errorf("expected unreadCount 0 after latest mark-read, got %d", resp.Data.UnreadCount)
 	}
+}
+
+// TestHandlerGetThread 覆盖 A9-S1 安全修复：线程读取必须先由父消息反查所属频道，
+// 再复用 ChannelPermission 的同口径做权限判定。
+//   - public 频道：有权限 -> 200，响应体仍是 messages/hasMore/total；
+//   - role-specific 频道且该角色无权限行：403 CHANNEL_ACCESS_DENIED；
+//   - 父消息不存在：404 MESSAGE_NOT_FOUND；
+//   - 拼接攻击：父消息属私有频道 A，请求额外携带 ?channelId=<public B> -> 仍 403；
+//   - 补齐该角色 CanView 权限行后同一请求 -> 200（证明判定取的是父消息自身频道）。
+func TestHandlerGetThread(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := testutil.MustSetupTestDB()
+	handler := NewHandler(db, config.DefaultConfig(), nil, nil)
+
+	now := time.Now().UTC()
+	channels := []model.Channel{
+		{ID: "ch-th-public", SpaceID: "sp-1", Name: "general", Type: "text", Visibility: "public"},
+		{ID: "ch-th-private", SpaceID: "sp-1", Name: "secret", Type: "text", Visibility: "role-specific"},
+	}
+	for i := range channels {
+		if err := db.Create(&channels[i]).Error; err != nil {
+			t.Fatalf("seed channel %s: %v", channels[i].ID, err)
+		}
+	}
+
+	publicParent := model.Message{ID: "msg-th-public-parent", ChannelID: "ch-th-public", UserID: "user-1", Content: "parent", CreatedAt: now, UpdatedAt: now}
+	privateParent := model.Message{ID: "msg-th-private-parent", ChannelID: "ch-th-private", UserID: "user-2", Content: "secret parent", CreatedAt: now, UpdatedAt: now}
+	for _, m := range []*model.Message{&publicParent, &privateParent} {
+		if err := db.Create(m).Error; err != nil {
+			t.Fatalf("seed parent message %s: %v", m.ID, err)
+		}
+	}
+	replyToPublic := model.Message{ID: "msg-th-public-reply", ChannelID: "ch-th-public", UserID: "user-2", Content: "reply", ParentID: &publicParent.ID, CreatedAt: now.Add(time.Second), UpdatedAt: now.Add(time.Second)}
+	replyToPrivate := model.Message{ID: "msg-th-private-reply", ChannelID: "ch-th-private", UserID: "user-1", Content: "secret reply", ParentID: &privateParent.ID, CreatedAt: now.Add(time.Second), UpdatedAt: now.Add(time.Second)}
+	for _, m := range []*model.Message{&replyToPublic, &replyToPrivate} {
+		if err := db.Create(m).Error; err != nil {
+			t.Fatalf("seed reply %s: %v", m.ID, err)
+		}
+	}
+
+	router := gin.New()
+	router.GET("/messages/:id/thread", func(c *gin.Context) {
+		setupAuthContext(c, "user-1", "testuser", middleware.RoleMember)
+		c.Next()
+	}, handler.GetThread)
+
+	doGet := func(t *testing.T, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", path, nil)
+		router.ServeHTTP(w, req)
+		return w
+	}
+	type threadResp struct {
+		Code string `json:"code"`
+		Data struct {
+			Messages []json.RawMessage `json:"messages"`
+			HasMore  bool              `json:"hasMore"`
+			Total    int               `json:"total"`
+		} `json:"data"`
+	}
+
+	t.Run("有权限读取 public 频道线程返回 200", func(t *testing.T) {
+		w := doGet(t, "/messages/msg-th-public-parent/thread")
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+		}
+		var resp threadResp
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if resp.Code != "OK" {
+			t.Errorf("expected code OK, got %q", resp.Code)
+		}
+		if len(resp.Data.Messages) != 1 || resp.Data.Total != 1 {
+			t.Errorf("expected 1 thread reply, got len=%d total=%d", len(resp.Data.Messages), resp.Data.Total)
+		}
+	})
+
+	t.Run("父消息不存在返回 404 MESSAGE_NOT_FOUND", func(t *testing.T) {
+		w := doGet(t, "/messages/msg-does-not-exist/thread")
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d, body: %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code string `json:"code"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp.Code != "MESSAGE_NOT_FOUND" {
+			t.Errorf("expected MESSAGE_NOT_FOUND, got %q (body: %s)", resp.Code, w.Body.String())
+		}
+	})
+
+	t.Run("role-specific 频道无权限返回 403 CHANNEL_ACCESS_DENIED", func(t *testing.T) {
+		w := doGet(t, "/messages/msg-th-private-parent/thread")
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d, body: %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code string `json:"code"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp.Code != "CHANNEL_ACCESS_DENIED" {
+			t.Errorf("expected CHANNEL_ACCESS_DENIED, got %q (body: %s)", resp.Code, w.Body.String())
+		}
+	})
+
+	t.Run("拼接攻击伪造 channelId 指向 public 频道仍被拒", func(t *testing.T) {
+		w := doGet(t, "/messages/msg-th-private-parent/thread?channelId=ch-th-public")
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d, body: %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Code string `json:"code"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp.Code != "CHANNEL_ACCESS_DENIED" {
+			t.Errorf("expected CHANNEL_ACCESS_DENIED, got %q (body: %s)", resp.Code, w.Body.String())
+		}
+	})
+
+	t.Run("补齐该角色 CanView 权限行后同一请求返回 200", func(t *testing.T) {
+		perm := model.ChannelRolePermission{
+			ID:        idgen.NextString(),
+			ChannelID: "ch-th-private",
+			Role:      middleware.RoleMember,
+			CanView:   true,
+			CanWrite:  true,
+		}
+		if err := db.Create(&perm).Error; err != nil {
+			t.Fatalf("seed channel role permission: %v", err)
+		}
+		w := doGet(t, "/messages/msg-th-private-parent/thread")
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+		}
+		var resp threadResp
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(resp.Data.Messages) != 1 {
+			t.Errorf("expected 1 reply after permission granted, got %d", len(resp.Data.Messages))
+		}
+	})
 }

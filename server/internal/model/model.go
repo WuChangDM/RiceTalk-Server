@@ -96,19 +96,24 @@ type MessageAttachment struct {
 
 // Message represents a chat message
 type Message struct {
-	ID                string              `gorm:"primaryKey;size:64" json:"id"`
-	ChannelID         string              `gorm:"size:64;not null;index;uniqueIndex:idx_msg_client_channel;index:idx_msg_channel_created,priority:1" json:"channelId"`
-	UserID            string              `gorm:"size:64;not null;index" json:"userId"`
-	AuthorUsername    string              `gorm:"size:32;default:''" json:"authorUsername"`
-	AuthorDisplayName string              `gorm:"size:64;default:''" json:"authorDisplayName"`
-	AuthorAvatarURL   string              `gorm:"size:512;default:''" json:"authorAvatarUrl"`
-	AuthorRole        string              `gorm:"size:16;default:'MEMBER'" json:"authorRole"`
-	Content           string              `gorm:"type:text;not null" json:"content"`
-	Type              string              `gorm:"size:20;default:'text';index" json:"type"` // text, image, video, file, mixed, system
-	ParentID          *string             `gorm:"size:64;index" json:"parentId"`
-	ClientMessageID   *string             `gorm:"size:64;uniqueIndex:idx_msg_client_channel" json:"clientMessageId"`
-	Reactions         []Reaction          `gorm:"-" json:"reactions,omitempty"`
-	Attachments       []MessageAttachment `gorm:"-" json:"attachments,omitempty"`
+	ID                string  `gorm:"primaryKey;size:64" json:"id"`
+	ChannelID         string  `gorm:"size:64;not null;index;uniqueIndex:idx_msg_client_channel;index:idx_msg_channel_created,priority:1" json:"channelId"`
+	UserID            string  `gorm:"size:64;not null;index" json:"userId"`
+	AuthorUsername    string  `gorm:"size:32;default:''" json:"authorUsername"`
+	AuthorDisplayName string  `gorm:"size:64;default:''" json:"authorDisplayName"`
+	AuthorAvatarURL   string  `gorm:"size:512;default:''" json:"authorAvatarUrl"`
+	AuthorRole        string  `gorm:"size:16;default:'MEMBER'" json:"authorRole"`
+	Content           string  `gorm:"type:text;not null" json:"content"`
+	Type              string  `gorm:"size:20;default:'text';index" json:"type"` // text, image, video, file, mixed, system
+	ParentID          *string `gorm:"size:64;index" json:"parentId"`
+	ClientMessageID   *string `gorm:"size:64;uniqueIndex:idx_msg_client_channel" json:"clientMessageId"`
+	// ForwardFrom 转发来源作者显示名快照（消息转发功能）：空串 = 非转发消息。
+	// 只存转发动作发生时源消息原作者的显示名快照（≤64 字符），不存被转发消息的
+	// 引用 ID、不做反向链接/转发计数（一期不做合并转发）；再转发时覆盖为最近一次
+	// 转发动作时源消息的作者名，不保留转发链。
+	ForwardFrom string              `gorm:"size:64;default:''" json:"forwardFrom,omitempty"`
+	Reactions   []Reaction          `gorm:"-" json:"reactions,omitempty"`
+	Attachments []MessageAttachment `gorm:"-" json:"attachments,omitempty"`
 	// MentionUserIDs is a transient set of user IDs mentioned in this message's
 	// content (stored inline as <@user_xxx> tokens). Not persisted; used by the
 	// handler to push mention notifications and bump MentionCount after insert.
@@ -130,9 +135,9 @@ type Reaction struct {
 
 // UserSession stores active login sessions
 type UserSession struct {
-	ID             string `gorm:"primaryKey;size:64" json:"id"`
-	UserID         string `gorm:"size:64;not null;index" json:"userId"`
-	TokenHash      string `gorm:"size:255;uniqueIndex" json:"-"`
+	ID             string    `gorm:"primaryKey;size:64" json:"id"`
+	UserID         string    `gorm:"size:64;not null;index" json:"userId"`
+	TokenHash      string    `gorm:"size:255;uniqueIndex" json:"-"`
 	ExpiresAt      time.Time `gorm:"not null" json:"expiresAt"`
 	IsAdminSession bool      `gorm:"default:false" json:"isAdminSession"`
 	// S-2 多设备标识：登录端上报的设备类型（如 windows-desktop/web）与设备名（如主机名）。
@@ -209,6 +214,20 @@ type UserChannelMute struct {
 	UpdatedAt  time.Time  `json:"updatedAt"`
 }
 
+// MessageThreadRead 线程级已读位（A9 二期，DES-20261029-01 §五）。
+// 线程未读 = 该 parent_id 下回复中 created_at > COALESCE(ReadAt, 频道已读水位)
+// 且非本人所发；本表只在用户对某线程 mark-read 时惰性 upsert 一行。
+type MessageThreadRead struct {
+	ID                string    `gorm:"primaryKey;size:64" json:"id"`
+	UserID            string    `gorm:"size:64;not null;uniqueIndex:idx_thread_read_user_parent" json:"userId"`
+	ParentID          string    `gorm:"size:64;not null;uniqueIndex:idx_thread_read_user_parent" json:"parentId"`
+	ChannelID         string    `gorm:"size:64;not null;index:idx_thread_read_user_channel" json:"channelId"`
+	LastReadMessageID string    `gorm:"size:64" json:"lastReadMessageId"`
+	ReadAt            time.Time `json:"readAt"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
 // ChannelRolePermission stores channel-level role permissions
 type ChannelRolePermission struct {
 	ID        string    `gorm:"primaryKey;size:64" json:"id"`
@@ -235,14 +254,23 @@ type OGCache struct {
 // VoiceRoom represents an independent voice room state.
 // A room belongs to a Space and may optionally be bound to a text/voice channel.
 type VoiceRoom struct {
-	ID            string    `gorm:"primaryKey;size:64" json:"id"`
-	SpaceID       string    `gorm:"size:64;not null;index" json:"spaceId"`
-	BindChannelID *string   `gorm:"size:64;index" json:"bindChannelId,omitempty"`
-	LiveKitRoom   string    `gorm:"size:128" json:"liveKitRoom"`
-	E2EEEnabled   bool      `gorm:"default:false" json:"e2eeEnabled"`
-	Quality       string    `gorm:"size:16;default:'standard'" json:"quality"`
-	CreatedAt     time.Time `json:"createdAt"`
-	UpdatedAt     time.Time `json:"updatedAt"`
+	ID            string  `gorm:"primaryKey;size:64" json:"id"`
+	SpaceID       string  `gorm:"size:64;not null;index" json:"spaceId"`
+	BindChannelID *string `gorm:"size:64;index" json:"bindChannelId,omitempty"`
+	LiveKitRoom   string  `gorm:"size:128" json:"liveKitRoom"`
+	E2EEEnabled   bool    `gorm:"default:false" json:"e2eeEnabled"`
+	// DES-20261006-01 §二（E2EE 二期·零知识密钥协商）：
+	//   - E2EEPassphraseEnabled=true 表示本房间启用「房间口令」派生模式；
+	//   - E2EEMagic 保管客户端上传的 magic 校验 blob（AES-GCM 密文的 base64）。
+	// 口令与派生密钥永不出端：服务端只保管密文 blob，无法解密房间内容，
+	// 也不在此路径保存/下发任何密钥本体（一期 server 模式的 E2EEKey 行保持不动，
+	// 口令清除后自动退回一期服务端分发模式）。两字段不外露到房间 JSON（json:"-"），
+	// 客户端一律经 GET /voice/e2ee/key 的 mode 字段感知口令模式。
+	E2EEPassphraseEnabled bool      `gorm:"default:false" json:"-"`
+	E2EEMagic             string    `gorm:"type:text" json:"-"`
+	Quality               string    `gorm:"size:16;default:'standard'" json:"quality"`
+	CreatedAt             time.Time `json:"createdAt"`
+	UpdatedAt             time.Time `json:"updatedAt"`
 }
 
 // VoiceParticipant tracks who is in a voice room
@@ -666,14 +694,14 @@ type ModuleRuntimeStatus struct {
 // inserting duplicates. MutedUntil silences WS pushes for the same type while
 // set; the row itself is still written (mute only suppresses notification).
 type AdminAlert struct {
-	ID           string     `gorm:"primaryKey;size:64" json:"id"`
-	Type         string     `gorm:"size:32;not null;index" json:"type"`
-	Severity     string     `gorm:"size:8;not null" json:"severity"`
-	Message      string     `gorm:"type:text" json:"message"`
-	FirstSeenAt  time.Time  `json:"firstSeenAt"`
-	LastSeenAt   time.Time  `json:"lastSeenAt"`
-	ResolvedAt   *time.Time `json:"resolvedAt"`
-	MutedUntil   *time.Time `json:"mutedUntil"`
+	ID          string     `gorm:"primaryKey;size:64" json:"id"`
+	Type        string     `gorm:"size:32;not null;index" json:"type"`
+	Severity    string     `gorm:"size:8;not null" json:"severity"`
+	Message     string     `gorm:"type:text" json:"message"`
+	FirstSeenAt time.Time  `json:"firstSeenAt"`
+	LastSeenAt  time.Time  `json:"lastSeenAt"`
+	ResolvedAt  *time.Time `json:"resolvedAt"`
+	MutedUntil  *time.Time `json:"mutedUntil"`
 }
 
 // Open reports whether the alert is still firing (not resolved).

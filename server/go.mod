@@ -18,6 +18,7 @@ require (
 	github.com/k2-fsa/sherpa-onnx-go v1.13.3
 	github.com/livekit/protocol v1.45.5-0.20260423163244-347de5a2ef78
 	github.com/livekit/server-sdk-go/v2 v2.16.3
+	github.com/okki-0417/mahjong v0.1.0
 	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/pion/webrtc/v4 v4.2.11
 	github.com/prometheus/client_golang v1.23.2

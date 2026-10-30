@@ -11,8 +11,8 @@ import (
 	"gorm.io/gorm/logger"
 
 	"github.com/sirupsen/logrus"
+	"ridgericetalk/internal/database/automigrate"
 	applogger "ridgericetalk/internal/logger"
-	"ridgericetalk/internal/model"
 )
 
 // poolEnvInt reads an int environment variable for connection pool tuning.
@@ -181,64 +181,7 @@ func Migrate(db *DB, log *applogger.Logger) error {
 		// 不返回错误，让 AutoMigrate 尝试继续（可能表已是正确状态）
 	}
 
-	if err := db.AutoMigrate(
-		&model.User{},
-		&model.Space{},
-		&model.Membership{},
-		&model.Channel{},
-		&model.DMChannel{},
-		&model.Message{},
-		&model.Reaction{},
-		&model.UserSession{},
-		&model.AdminBootstrapToken{},
-		&model.UserPresence{},
-		&model.UserChannelRead{},
-		&model.ChannelRolePermission{},
-		&model.OGCache{},
-		&model.VoiceRoom{},
-		&model.VoiceParticipant{},
-		&model.BotPlayQueue{},
-		&model.BotPlayerState{},
-		&model.BotUploadAudio{},
-		&model.BotTTSMessage{},
-		&model.TTSConsent{},
-		&model.Whiteboard{},
-		&model.WhiteboardStroke{},
-		&model.FileMetadata{},
-		&model.SharedFolder{},
-		&model.SharedFileEntry{},
-		&model.SharedDocument{},
-		&model.SharedDocumentVersion{}, // M25: 文档版本历史
-		&model.SharedDocumentComment{}, // Phase 2: 文档评论
-		&model.ScheduleEvent{},
-		&model.ScheduleEventInvite{}, // A8-S1: 日程事件邀请 RSVP（SQLite 开发环境建表；生产走 000039 迁移）
-		&model.MinigameSession{},
-		&model.MinigameHistory{},     // §15.4: 游戏历史记录
-		&model.MinigameLeaderboard{}, // §15.7.4: 单机游戏排行榜（此前漏迁移，导致提交/查询报 no such table）
-		&model.VirtualNetSession{},
-		&model.VirtualNetNode{},
-		&model.AdminConfig{},
-		&model.AuditLog{},
-		&model.ModuleRuntimeStatus{},
-		&model.ScreenShareSession{},
-		&model.MessageAck{},
-		&model.SecurityAuditLog{},
-		&model.PasswordHistory{},
-		&model.SecurityQuestion{},
-		&model.PasswordResetToken{},
-		&model.VoiceRecording{},
-		&model.E2EEKey{},
-		&model.NeteaseAuth{},
-		&model.Bot{},
-		&model.RemoteAssistSession{}, // T49: 远程协助会话
-		&model.UserSound{},          // 出入频道音效库
-		&model.UserSoundSettings{},  // 个人入场/出场音效绑定
-		&model.UserSoundFavorite{},  // 音效收藏
-		&model.CloudFileShare{},     // DES-2026-0912-05: 云文件分享链接（SQLite 开发环境建表；生产走 000035 迁移）
-		&model.UserChannelMute{},    // T4/S-1: 频道级静音（SQLite 开发环境建表；生产走 000036 迁移）
-		&model.AdminAlert{},         // DES-20261001-01 §12: 管理后台监控告警（SQLite 开发环境建表；生产走 000040 迁移）
-		&model.ServerEmoji{},        // DES-20261002-01 §4.7: B7 自定义服务器表情（SQLite 开发环境建表；生产走 000041 迁移）
-	); err != nil {
+	if err := db.AutoMigrate(automigrate.AllModels()...); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 

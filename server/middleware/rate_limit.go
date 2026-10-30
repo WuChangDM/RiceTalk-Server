@@ -215,3 +215,33 @@ func AuthRateLimit() *RateLimiter {
 	}
 	return NewRateLimiter(requests, burst)
 }
+
+// AuthIPRateLimit returns a dedicated, independent limiter instance for the
+// credential endpoints (POST /auth/login, POST /auth/register). D2 加固：这两个
+// 端点是爆破/main.go 凭据填充的首要目标，在全局桶与 auth 组级桶之外再叠一道
+// **按 IP** 的更严限制，且独立实例的计数不受其他 /auth 端点流量挤占。
+//
+// 默认 10 次/分钟/IP、突发 5。RRT_AUTH_RATE_LIMIT_PER_MIN / 
+// RRT_AUTH_RATE_LIMIT_BURST 可调（BURST 与 AuthRateLimit 共用同一变量）。
+// RRT_AUTH_RATE_LIMIT_PER_MIN=0 表示不启用专用限速：返回 nil，调用方跳过
+// 挂载，流量退回全局桶 + auth 组级桶（自托管小实例的逃生口）。
+//
+// 每 IP 语义说明：RateLimit 中间件对已认证请求会把 key 切到 "user:<id>"，
+// 但登录/注册在中间件阶段尚未认证（AuthRequired 在 handler 之后才执行），
+// key 恒为 ClientIP，天然按 IP 计数。
+func AuthIPRateLimit() *RateLimiter {
+	requests := 10
+	burst := 5
+	if v, err := strconv.Atoi(os.Getenv("RRT_AUTH_RATE_LIMIT_PER_MIN")); err == nil {
+		if v == 0 {
+			return nil
+		}
+		if v > 0 {
+			requests = v
+		}
+	}
+	if v, err := strconv.Atoi(os.Getenv("RRT_AUTH_RATE_LIMIT_BURST")); err == nil && v > 0 {
+		burst = v
+	}
+	return NewRateLimiter(requests, burst)
+}

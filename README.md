@@ -35,8 +35,9 @@ sudo bash server/scripts/deploy-embedded.sh   # 自动探测公网 IP，可加 -
 Windows 桌面客户端（RiceTalk）不随本仓库分发，统一从 GitHub Releases 页面下载：
 
 - **下载页**：<https://github.com/WuChangDM/RiceTalk-Desktop/releases>
-- **产物形态**：**portable 绿色版**（`RiceTalk-<版本>-portable.exe`），单文件、免安装、双击即用；不提供安装包（NSIS）作为发布产物
+- **产物形态**：**portable 绿色版**（`RidgeRiceTalk-<版本>-portable.exe`），单文件、免安装、双击即用；不提供安装包（NSIS）作为发布产物
 - **版本口径**：**当前可用版本以 Releases 页为准**（`Assets` 内最新 `portable.exe` 即为最新版）；本 README 不维护版本号清单
+- **最近发布**：**v1.9.2**（2026-10-30，客户端 1.9.2 / 服务端 0.4.0）
 
 > 首次使用：部署并初始化服务端（见上方快速开始）→ 打开客户端 → 输入 `服务器IP:端口` 加入。
 

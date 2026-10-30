@@ -129,7 +129,7 @@ export default function LoginForm({ bootstrapInitialized, onSessionChange }: Log
                 <input className="auth-input" aria-label="用户名" placeholder="用户名" value={bootstrapUsername} onChange={e => setBootstrapUsername(e.target.value)} />
                 <input className="auth-input" aria-label="显示名" placeholder="显示名（可选，默认同用户名）" value={bootstrapDisplayName} onChange={e => setBootstrapDisplayName(e.target.value)} />
                 <input className="auth-input" aria-label="邮箱" placeholder="邮箱" value={bootstrapEmail} onChange={e => setBootstrapEmail(e.target.value)} />
-                <input className="auth-input" aria-label="密码" placeholder="密码（至少 8 位）" type="password" value={bootstrapPassword} onChange={e => setBootstrapPassword(e.target.value)} />
+                <input className="auth-input" aria-label="密码" placeholder="密码（至少 12 位，建议字母+数字）" type="password" value={bootstrapPassword} onChange={e => setBootstrapPassword(e.target.value)} />
                 <input className="auth-input" aria-label="空间名称" placeholder="空间名称（可选，默认 RidgeRiceTalk）" value={bootstrapSpaceName} onChange={e => setBootstrapSpaceName(e.target.value)} />
                 <button
                   className="auth-btn"
@@ -140,8 +140,8 @@ export default function LoginForm({ bootstrapInitialized, onSessionChange }: Log
                       setBootstrapError('请填写所有必填字段')
                       return
                     }
-                    if (bootstrapPassword.length < 8) {
-                      setBootstrapError('密码至少 8 位')
+                    if (bootstrapPassword.length < 12) {
+                      setBootstrapError('密码至少 12 位（服务端要求，建议字母+数字组合）')
                       return
                     }
                     setCreatingOwner(true)
@@ -167,7 +167,14 @@ export default function LoginForm({ bootstrapInitialized, onSessionChange }: Log
                         setBootstrapError('初始化响应异常')
                       }
                     } catch (err: any) {
-                      setBootstrapError(err.message || '初始化失败')
+                      // 服务端校验失败时优先展示 details 的中文解释，避免界面只显示 “bad request”
+                      const raw = String(err?.details || err?.message || '')
+                      let hint = ''
+                      if (/password must be at least (\d+)/i.test(raw)) hint = '密码长度不足（服务端要求至少 12 位，建议字母+数字组合）'
+                      else if (/invalid email/i.test(raw)) hint = '邮箱格式不正确，请填写完整邮箱地址'
+                      else if (/already initialized/i.test(raw)) hint = '服务端已经初始化过了，请直接登录'
+                      else if (/security question/i.test(raw)) hint = '安全问答未通过校验'
+                      setBootstrapError(hint || err?.message || '初始化失败')
                     } finally {
                       setCreatingOwner(false)
                     }

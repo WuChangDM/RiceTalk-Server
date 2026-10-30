@@ -64,6 +64,9 @@ func (h *Handler) RegisterRoutes(r *gin.RouterGroup) {
 		voice.GET("/recordings", h.GetRecordings)
 		voice.GET("/e2ee/key", h.GetE2EEKey)
 		voice.POST("/e2ee/key/rotate", middleware.RequireAdmin(), h.RotateE2EEKey)
+		// DES-20261006-01 §二：房间口令（零知识密钥协商）。
+		// 权限与频道/语音写接口一致（RequireAdmin：OWNER/ADMIN）。
+		voice.PUT("/e2ee/passphrase", middleware.RequireAdmin(), h.SetE2EEPassphrase)
 	}
 }
 
@@ -85,20 +88,156 @@ func (h *Handler) broadcastVoiceEvent(roomID string, data []byte) {
 	}
 }
 
-// GetE2EEKey returns the E2EE key for a room (or generates one if it doesn't exist)
+// voiceChannelAccessRow 是一次 JOIN（channels → 角色频道权限）的结果（R-02）。
+type voiceChannelAccessRow struct {
+	ID          string `gorm:"column:id"`
+	ChannelType string `gorm:"column:type"`
+	Visibility  string `gorm:"column:visibility"`
+	CanView     *bool  `gorm:"column:can_view"`
+}
+
+// resolveVoiceRoomChannelID 解析语音房间对应的频道 ID（R-02）。
+// 返回 ("", nil) 表示该房间未绑定频道（独立房间）：没有频道可见性可判，
+// 由 service 层既有的「空间成员」校验兜底。
+func (h *Handler) resolveVoiceRoomChannelID(roomID string) (string, *errors.AppError) {
+	var room model.VoiceRoom
+	if err := h.db.Select("id", "bind_channel_id").First(&room, "id = ?", roomID).Error; err == nil {
+		if room.BindChannelID != nil && *room.BindChannelID != "" {
+			return *room.BindChannelID, nil
+		}
+		return "", nil
+	} else if err != gorm.ErrRecordNotFound {
+		return "", errors.ErrInternal
+	}
+
+	// 房间记录尚未创建：roomID 可能就是频道 ID（findOrCreateVoiceRoom 会自动 provision），
+	// 或已有独立房间绑定到该频道。两种情况都按该频道做可见性校验。
+	var bound model.VoiceRoom
+	if err := h.db.Select("id").First(&bound, "bind_channel_id = ?", roomID).Error; err == nil {
+		return roomID, nil
+	} else if err != gorm.ErrRecordNotFound {
+		return "", errors.ErrInternal
+	}
+	var channel model.Channel
+	if err := h.db.Select("id").First(&channel, "id = ?", roomID).Error; err == nil {
+		return channel.ID, nil
+	} else if err != gorm.ErrRecordNotFound {
+		return "", errors.ErrInternal
+	}
+	return "", errors.New(errors.VOICE_ROOM_NOT_FOUND, "voice room not found")
+}
+
+// loadVoiceChannelAccess 用一次 JOIN 取频道可见性 + 当前角色的 can_view（R-02）。
+func (h *Handler) loadVoiceChannelAccess(c *gin.Context, channelID string) (*voiceChannelAccessRow, *errors.AppError) {
+	var row voiceChannelAccessRow
+	if err := h.db.Table("channels AS c").
+		Select("c.id AS id, COALESCE(c.type, '') AS type, COALESCE(c.visibility, '') AS visibility, crp.can_view AS can_view").
+		Joins("LEFT JOIN channel_role_permissions AS crp ON crp.channel_id = c.id AND crp.role = ?", middleware.GetRole(c)).
+		Where("c.id = ? AND c.deleted_at IS NULL", channelID).
+		Take(&row).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, errors.New(errors.CHANNEL_NOT_FOUND, "channel not found")
+		}
+		return nil, errors.ErrInternal
+	}
+	return &row, nil
+}
+
+// authorizeVoiceRoomAccess 在**签发 LiveKit token / 加入房间之前**做频道可见性校验（R-02）。
+// 事件注入与媒体面越权的共同入口：token 一旦签发即不可回收，因此校验必须前置到 service 调用之前。
+// 复用 middleware.CheckChannelAccess 纯内核：DM → 404 CHANNEL_NOT_FOUND（先于 OWNER）、
+// public 放行、admin-only 非 ADMIN → 403、role-specific 无行或 can_view=false → 403、
+// 未知 visibility → 403；频道不存在/已软删 → 404 CHANNEL_NOT_FOUND。
+func (h *Handler) authorizeVoiceRoomAccess(c *gin.Context, roomID string) bool {
+	channelID, appErr := h.resolveVoiceRoomChannelID(roomID)
+	if appErr != nil {
+		errors.JSONError(c, appErr)
+		return false
+	}
+	if channelID == "" {
+		return true
+	}
+	row, appErr := h.loadVoiceChannelAccess(c, channelID)
+	if appErr != nil {
+		errors.JSONError(c, appErr)
+		return false
+	}
+	if appErr := middleware.CheckChannelAccess(c, &model.Channel{
+		ID:         row.ID,
+		Type:       row.ChannelType,
+		Visibility: row.Visibility,
+	}, row.CanView); appErr != nil {
+		errors.JSONError(c, appErr)
+		return false
+	}
+	return true
+}
+
+// GetE2EEKey returns the E2EE material for a room (or generates one if it doesn't exist).
+// DES-20261006-01 §二：按房间模式分派响应（data 包装保持一期结构）：
+//   - 口令房：{"mode":"passphrase","magic":"<blob>"} —— 不返回 key；
+//   - 一期模式：{"mode":"server","key":"<hex>"} —— 行为与一期一致（新增 mode 字段）。
 func (h *Handler) GetE2EEKey(c *gin.Context) {
 	roomID := c.Query("roomId")
 	if roomID == "" {
 		errors.JSONError(c, errors.ErrBadRequest.WithDetails("roomId is required"))
 		return
 	}
+	// R-04：频道可见性闸门只拦「会实际下发密钥本体」的 server 模式。
+	//   - 模式判定只读房间元数据（E2EEKeyMode），不读库取 key、不生成 key；
+	//   - 403 分支因此不会产生 e2ee_keys 行，也不写任何日志明文；
+	//   - 二期口令/客户端自持密钥模式（passphrase）不依赖服务端下发密钥，
+	//     保持既有判定顺序与可用性，不因频道可见性把口令房成员锁死。
+	// 判定顺序与 R-02 一致：DM → 404 CHANNEL_NOT_FOUND（先于 OWNER 放行）、
+	// 无权限 → 403 CHANNEL_ACCESS_DENIED、房间/频道不存在或已软删 → 404。
+	keyMode, modeErr := h.service.E2EEKeyMode(roomID)
+	if modeErr != nil {
+		errors.JSONError(c, modeErr)
+		return
+	}
+	if keyMode == E2EEModeServer && !h.authorizeVoiceRoomAccess(c, roomID) {
+		return
+	}
+
 	userID := middleware.GetUserID(c)
-	key, err := h.service.GetE2EEKey(roomID, userID)
+	info, err := h.service.GetE2EEKey(roomID, userID)
 	if err != nil {
 		errors.JSONError(c, err)
 		return
 	}
-	errors.Success(c, gin.H{"key": key})
+	if info.Mode == E2EEModePassphrase {
+		errors.Success(c, gin.H{"mode": info.Mode, "magic": info.Magic})
+		return
+	}
+	errors.Success(c, gin.H{"mode": info.Mode, "key": info.Key})
+}
+
+// SetE2EEPassphrase sets or clears the room passphrase magic blob.
+// DES-20261006-01 §二：body {"roomId": "...", "magic": "<blob>"|null}。
+// magic 非空 = 启用口令模式（≤4KB、合法 base64）；null/空 = 清除，退回一期模式。
+// 权限：路由层 RequireAdmin()（OWNER/ADMIN，与频道设置写接口一致）。
+func (h *Handler) SetE2EEPassphrase(c *gin.Context) {
+	var body struct {
+		RoomID string  `json:"roomId"`
+		Magic  *string `json:"magic"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		errors.JSONError(c, errors.ErrBadRequest)
+		return
+	}
+	if body.RoomID == "" {
+		errors.JSONError(c, errors.ErrBadRequest.WithDetails("roomId is required"))
+		return
+	}
+	if err := h.service.SetE2EEPassphrase(body.RoomID, body.Magic); err != nil {
+		errors.JSONError(c, err)
+		return
+	}
+	enabled := body.Magic != nil && *body.Magic != ""
+	errors.Success(c, gin.H{
+		"message":           map[bool]string{true: "房间口令已更新", false: "房间口令已清除"}[enabled],
+		"passphraseEnabled": enabled,
+	})
 }
 
 // RotateE2EEKey generates a new E2EE key for a room, invalidating the old one
@@ -133,6 +272,11 @@ func (h *Handler) GetToken(c *gin.Context) {
 		return
 	}
 
+	// R-02：签发 token 之前先做频道可见性校验（token 一旦返回即不可回收）。
+	if !h.authorizeVoiceRoomAccess(c, body.RoomID) {
+		return
+	}
+
 	userID := middleware.GetUserID(c)
 	username := middleware.GetUsername(c)
 	role := middleware.GetRole(c)
@@ -154,6 +298,10 @@ func (h *Handler) GetToken(c *gin.Context) {
 // GetParticipants returns participants in a voice room
 func (h *Handler) GetParticipants(c *gin.Context) {
 	roomID := c.Param("id")
+	// R-04：参与者名单同样受频道可见性保护（私有房的成员名单/是否有人在房属于敏感信息）。
+	if !h.authorizeVoiceRoomAccess(c, roomID) {
+		return
+	}
 	participants, err := h.service.GetParticipants(roomID)
 	if err != nil {
 		errors.JSONError(c, err)
@@ -171,6 +319,11 @@ func (h *Handler) JoinVoice(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		errors.JSONError(c, errors.ErrBadRequest)
+		return
+	}
+
+	// R-02：加入房间（媒体面）之前同样做频道可见性校验。
+	if !h.authorizeVoiceRoomAccess(c, body.RoomID) {
 		return
 	}
 
@@ -211,6 +364,11 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		errors.JSONError(c, errors.ErrBadRequest)
+		return
+	}
+
+	// R-02：签发 token 之前先做频道可见性校验（token 一旦返回即不可回收）。
+	if !h.authorizeVoiceRoomAccess(c, body.RoomID) {
 		return
 	}
 

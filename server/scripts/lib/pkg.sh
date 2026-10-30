@@ -10,7 +10,8 @@
 #     rrt_pkg_update
 #     rrt_pkg_install postgresql ffmpeg jq curl ...
 #
-# ⚠️ 当前接通 apt / dnf 两个后端；apk 分支按 G-2 要求「明确报错并退出」，不做任何
+# ⚠️ 当前接通 apt / dnf / apk 三个后端（apk=G-4，2026-10-05；Alpine 上 sherpa-onnx
+#    为 glibc 专有，TTS 由调用方降级提示，见 deploy-baremetal G-4 段）；
 #    安装动作 —— 在未验证的发行版上真的去装包会留下半装状态，比直接失败更糟。
 #    dnf 后端（G-3，DES-2026-0912-03 P2）：Rocky/Alma/CentOS/Fedora 用 dnf，
 #    无 dnf 的老版本（CentOS 7）回退 yum（两者 install/-y CLI 兼容，rrt_pkg_manager
@@ -140,7 +141,7 @@ rrt_pkg_update() {
             "$cmd" -q -y makecache
             ;;
         apk)
-            rrt__pkg_unimplemented "$(rrt_pkg_manager)" "更新包索引"
+            apk update --quiet
             ;;
         *)
             rrt_fail "无法识别的包管理器，无法更新包索引：请确认系统为 Debian 系（apt）或 RHEL 系（dnf/yum）（当前家族: $(rrt_os_family)）"
@@ -162,7 +163,8 @@ rrt_pkg_install() {
             rrt__pkg_install_dnf "$@"
             ;;
         apk)
-            rrt__pkg_unimplemented "$(rrt_pkg_manager)" "安装: $*"
+            # G-4：apk add --no-cache（无索引常驻，容器/精简镜像友好）
+            rrt__pkg_install_apk "$@"
             ;;
         *)
             rrt_fail "无法识别的包管理器，无法安装: $*（当前系统家族: $(rrt_os_family)）"
@@ -170,6 +172,14 @@ rrt_pkg_install() {
             exit 1
             ;;
     esac
+}
+
+# apk 后端（G-4）：apk add --no-cache 逐包安装（apk 自身并发安全，单命令批量装）
+rrt__pkg_install_apk() {
+    local pkgs
+    pkgs="$(rrt_pkg_names apk "$@")" || exit 1
+    [[ -n "$pkgs" ]] || return 0
+    apk add --no-cache $pkgs
 }
 
 # apt 后端：与改造前完全一致的安装命令

@@ -42,7 +42,26 @@ func (h *Handler) SubmitScore(c *gin.Context) {
 		return
 	}
 
-	// 已知但不提供排行榜的游戏（多人联机游戏）拒绝提交（设计 §15.7.4）。
+	// D1（task-65）：多人棋类为服务端权威计分（胜场数），客户端上传的 score 一律忽略。
+	// 这里仍返回 200 + 当前成绩，保留请求体字段以兼容旧客户端；实际加分由
+	// finishGame -> addAuthoritativeWin 在服务端结算时完成。
+	if isAuthoritativeScored(body.GameType) {
+		bestScore := int64(0)
+		var authoritativeRow model.MinigameLeaderboard
+		if err := h.db.Where("game_type = ? AND user_id = ?", body.GameType, middleware.GetUserID(c)).
+			First(&authoritativeRow).Error; err == nil {
+			bestScore = authoritativeRow.BestScore
+		}
+		errors.Success(c, gin.H{
+			"bestScore":     bestScore,
+			"updated":       false,
+			"authoritative": true,
+			"dimension":     authoritativeScoreDimension,
+		})
+		return
+	}
+
+	// 已知但不提供排行榜的游戏（狼人杀/斗地主/日麻）拒绝提交（设计 §15.7.4）。
 	if info, ok := getGameInfo(body.GameType); ok && info.ScoreDimension == "" {
 		errors.JSONError(c, errors.New(errors.MINIGAME_INVALID_ACTION, "this game has no leaderboard"))
 		return
@@ -59,29 +78,42 @@ func (h *Handler) SubmitScore(c *gin.Context) {
 		return candidate > current
 	}
 
-	record := model.MinigameLeaderboard{
-		ID:        idgen.NextString(),
-		GameType:  body.GameType,
-		UserID:    userID,
-		Username:  "",
-		BestScore: body.Score,
-	}
-
-	// Upsert while keeping the best score for the game's ranking direction.
+	// 先读已有记录：既用于单机分数校验的基线，也用于后续 upsert 决策。
 	var existing model.MinigameLeaderboard
 	err := h.db.Where("game_type = ? AND user_id = ?", body.GameType, userID).First(&existing).Error
+	hasExisting := err == nil
+	currentBest := int64(0)
+	if hasExisting {
+		currentBest = existing.BestScore
+	}
+
+	// D1：单机排行榜限分数上限 + 异常暴涨检测（阈值见 score.go 的 singlePlayerScoreCaps）。
+	if info, ok := getGameInfo(body.GameType); ok && info.LocalOnly {
+		if verr := validateSinglePlayerScore(info, body.Score, currentBest); verr != nil {
+			errors.JSONError(c, verr)
+			return
+		}
+	}
+
+	record := existing
 	updated := false
-	if err == nil {
+	if hasExisting {
 		if best(existing.BestScore, body.Score) {
-			existing.BestScore = body.Score
-			if saveErr := h.db.Save(&existing).Error; saveErr != nil {
+			record.BestScore = body.Score
+			if saveErr := h.db.Save(&record).Error; saveErr != nil {
 				errors.JSONError(c, errors.ErrInternal)
 				return
 			}
 			updated = true
 		}
-		record = existing
 	} else {
+		record = model.MinigameLeaderboard{
+			ID:        idgen.NextString(),
+			GameType:  body.GameType,
+			UserID:    userID,
+			Username:  "",
+			BestScore: body.Score,
+		}
 		if createErr := h.db.Create(&record).Error; createErr != nil {
 			errors.JSONError(c, errors.ErrInternal)
 			return
@@ -120,13 +152,29 @@ func (h *Handler) GetLeaderboard(c *gin.Context) {
 	}
 
 	var records []model.MinigameLeaderboard
+	// 多取若干行再按 userId 去重：历史上并发提交可能为同一用户写出多条
+	// （表上无 (game_type,user_id) 唯一约束），直接 Limit(limit) 会让榜单出现重复用户。
 	if err := h.db.Where("game_type = ? AND best_score > 0", gameType).
 		Order(orderClause).
-		Limit(limit).
+		Limit(limit * 4).
 		Find(&records).Error; err != nil {
 		errors.JSONError(c, errors.ErrInternal)
 		return
 	}
+	// 结果已按名次方向排序，同一用户保留首次出现（即最好成绩）的那一行。
+	deduped := make([]model.MinigameLeaderboard, 0, len(records))
+	seen := make(map[string]struct{}, len(records))
+	for _, r := range records {
+		if _, ok := seen[r.UserID]; ok {
+			continue
+		}
+		seen[r.UserID] = struct{}{}
+		deduped = append(deduped, r)
+		if len(deduped) >= limit {
+			break
+		}
+	}
+	records = deduped
 
 	// username 已退役：排行榜显示名读时按 UserID 解析当前 displayName（覆盖遗留快照）。
 	nameMap := make(map[string]string, len(records))

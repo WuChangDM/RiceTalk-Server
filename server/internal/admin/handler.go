@@ -93,6 +93,8 @@ func (h *Handler) RegisterRoutes(r *gin.RouterGroup) {
 		admin.GET("/modules", h.GetModules)
 		admin.POST("/modules/:module/actions", h.ModuleAction)
 		admin.GET("/runtime", h.GetRuntime)
+		// M2 观测性：实时房间/在线/屏幕共享指标（admin 监控页 5s 轮询）
+		admin.GET("/metrics/realtime", h.GetRealtimeMetrics)
 		admin.GET("/system/usage", h.GetSystemUsage)
 		admin.GET("/audit-logs", h.GetAuditLogs)
 		admin.GET("/audit-logs/export", h.ExportAuditLogs)

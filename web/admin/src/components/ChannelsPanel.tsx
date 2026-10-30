@@ -314,7 +314,7 @@ export default function ChannelsPanel({ users }: ChannelsPanelProps) {
                 <td>语音</td>
                 <td>{renderGroupCell(c)}</td>
                 <td>
-                  <select className="select" aria-label="音频质量" style={{ minWidth: 110, padding: '4px 8px' }} value={audioQuality[c.id] || (c as any).voiceQuality || 'standard'} onChange={async e => {
+                  <select className="select" aria-label="音频质量" style={{ minWidth: 110, padding: '4px 8px' }} value={audioQuality[c.id] || c.voiceQuality || 'standard'} onChange={async e => {
                     const newQuality = e.target.value
                     setAudioQuality({ ...audioQuality, [c.id]: newQuality })
                     try {

@@ -13,6 +13,7 @@ RidgeRiceTalk 服务端使用了以下开源组件。各组件版权归其原作
 | golang.org/crypto | bcrypt 等加密原语 | BSD-3-Clause |
 | google/uuid | UUID | BSD-3-Clause |
 | gorilla/websocket 或 nhooyr/websocket | WebSocket（以 go.mod 实际为准） | MIT/BSD |
+| okki-0417/mahjong | 日本麻将规则内核（牌山/鸣牌/立直/和牌判定/役种/符点，仅经 `features/minigames/riichi/core` 适配层调用） | MIT |
 
 ## 实时语音
 

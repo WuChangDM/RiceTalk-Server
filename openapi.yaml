@@ -147,7 +147,11 @@ paths:
     post:
       tags: [Authentication]
       summary: 用户登录
-      description: 使用邮箱和密码登录，返回用户信息和JWT令牌。
+      description: |
+        使用邮箱和密码登录，返回用户信息和JWT令牌。
+        限速三道：全局令牌桶（所有 API）、auth 组级桶（/auth/*），
+        以及 D2 加固的登录/注册专用每 IP 桶（默认 10 次/分钟/IP、突发 5，
+        RRT_AUTH_RATE_LIMIT_PER_MIN / RRT_AUTH_RATE_LIMIT_BURST 可调，0=关闭专用桶）。
       security: []  # 登录无需认证
       requestBody:
         required: true
@@ -185,6 +189,23 @@ paths:
                     message: 账户已锁定，请30分钟后重试
                     details:
                       lock_expires_at: '2024-01-15T09:00:00Z'
+        '429':
+          description: 请求过于频繁（组级或登录专用每 IP 限速命中）
+          headers:
+            Retry-After:
+              description: 建议重试等待秒数
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                RateLimited:
+                  value:
+                    code: SYSTEM_RATE_LIMITED
+                    message: too many requests
+                    chinese_message: 操作过于频繁，请稍后再试
   /api/v1/auth/logout:
     post:
       tags: [Authentication]
@@ -1147,23 +1168,31 @@ paths:
               schema:
                 type: object
                 required:
-                - messages
+                - items
                 - hasMore
                 properties:
-                  messages:
+                  items:
                     type: array
-                    description: 消息列表
+                    description: 本页消息（A9 二期起**仅返回顶层消息**，线程回复只在 `GET /messages/{id}/thread`；每项含 `threadReplyCount`，无回复时为 0）
                     items:
                       $ref: '#/components/schemas/Message'
                   hasMore:
                     type: boolean
                     description: 是否有更多消息
                     example: true
-                  nextCursor:
+                  cursor:
                     type: string
                     nullable: true
-                    description: 下一页游标
+                    description: 下一页游标（null/空表示无更多）
                     example: eyJpZCI6Im1zZ18xMjMifQ
+                  threadParentId:
+                    type: string
+                    description: 仅 around 命中线程回复时返回：所属父消息 ID（此时返回的是父消息所在页，页内不含该回复）
+                    example: msg_parent001
+                  focusMessageId:
+                    type: string
+                    description: 仅 around 命中线程回复时返回：客户端原始请求定位的回复消息 ID
+                    example: msg_reply001
         '404':
           description: 频道不存在，或 around 指定的消息不存在/不属于该频道
           content:
@@ -1220,6 +1249,19 @@ paths:
                   nullable: true
                   description: 客户端生成的消息ID（用于去重）
                   example: cmid_client_1699880000
+                forwardFrom:
+                  type: string
+                  maxLength: 64
+                  description: 转发来源作者显示名快照（转发时传入，空 = 普通消息）
+                  example: 张三
+                attachmentIds:
+                  type: array
+                  maxItems: 10
+                  description: |-
+                    附件引用复制（消息转发用）：传入源消息的附件 ID 数组，服务端为每条
+                    源附件新建附件行并复用同一云文件（零物理拷贝）；去重、未知 ID 宽松忽略。
+                  items:
+                    type: string
       responses:
         '201':
           description: 消息发送成功
@@ -1322,18 +1364,44 @@ paths:
                 required:
                 - messages
                 - hasMore
+                - total
                 properties:
                   messages:
                     type: array
-                    description: 回复消息列表
+                    description: 本页回复消息（受 limit 约束，按创建时间升序；不含已软删除回复）
                     items:
                       $ref: '#/components/schemas/Message'
                   hasMore:
                     type: boolean
-                    description: 是否有更多回复
+                    description: 是否还有更多回复（本页是否被 limit 截断）
                     example: false
+                  total:
+                    type: integer
+                    minimum: 0
+                    description: 该线程回复总数（不含已软删除回复），不受 limit 截断；与 `threadReplyCount` 同源同值（查询失败时退化为本页条数）
+                    example: 12
+                  threadReplyCount:
+                    type: integer
+                    minimum: 0
+                    description: 该父消息的全部直接回复数（A9 二期；不含已软删除回复），与 `total` 同源同值，不受 limit 影响
+                    example: 12
+        '403':
+          description: 无该父消息所属频道的访问权限
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                CHANNELAccessDenied:
+                  value:
+                    code: CHANNEL_ACCESS_DENIED
+                    message: 频道访问被拒绝
         '404':
-          description: 消息不存在
+          description: |-
+            消息/线程不可读，三种情形统一返回 404 MESSAGE_NOT_FOUND：
+            ①父消息不存在；②父消息不属于该频道（父消息已删除/已迁移）；③该线程无可见回复（含回复已被全部删除或并发删除）。
+            频道本身已删除/不存在时返回 404 CHANNEL_NOT_FOUND。
+            客户端收到 404 应回退为「线程不存在/已清空」并刷新主列表。
           content:
             application/json:
               schema:
@@ -1343,6 +1411,10 @@ paths:
                   value:
                     code: MESSAGE_NOT_FOUND
                     message: 消息不存在
+                CHANNELNotFound:
+                  value:
+                    code: CHANNEL_NOT_FOUND
+                    message: 频道不存在
   /api/v1/messages/{id}/reactions:
     parameters:
     - name: id
@@ -2202,6 +2274,61 @@ paths:
                   value:
                     code: FORBIDDEN
                     message: 仅管理员可访问
+  # ── M2 观测性：实时房间/在线/屏幕共享指标（admin 监控页 5s 轮询）──
+  # 实际路由同时挂在 /api/admin/... 与 /api/v1/admin/... 两个前缀下，此处登记 v1 形式。
+  /api/v1/admin/metrics/realtime:
+    get:
+      tags: [Admin]
+      summary: 获取实时房间与在线指标（admin）
+      description: |
+        聚合实时业务指标：语音房间逐房人数、在线用户数、进行中屏幕共享数。
+        数据源：在线用户取 realtime Hub 内存态（去重用户）；逐房人数取
+        voice_participants（left_at IS NULL 的在房成员，按 room_id 分组）；
+        屏幕共享取 screen_share_sessions（active = true）。全部为内存快照与
+        只读聚合查询。设计供 admin 监控页 5s 轮询。
+      security:
+      - BearerAuth: []
+      - CookieAuth: []
+      responses:
+        '200':
+          description: 实时指标
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: {type: string, example: OK}
+                  data:
+                    type: object
+                    properties:
+                      rooms:
+                        type: array
+                        description: 语音房间逐房人数（仅含有成员的房间）
+                        items:
+                          type: object
+                          properties:
+                            roomId: {type: string, description: 语音房间 ID（voice_rooms.id）}
+                            participantCount: {type: integer, description: 在房成员数（left_at IS NULL）}
+                      onlineUsers: {type: integer, description: 在线用户数（去重，Hub 连接态）}
+                      activeScreenshares: {type: integer, description: 进行中的屏幕共享会话数（active = true）}
+                      voiceRooms: {type: integer, description: 语音房间数（= rooms 长度，冗余字段便于直读）}
+              examples:
+                default:
+                  value:
+                    code: OK
+                    data:
+                      rooms:
+                      - roomId: vr_01HXXXXXXX
+                        participantCount: 3
+                      onlineUsers: 12
+                      activeScreenshares: 1
+                      voiceRooms: 1
+        '403':
+          description: 无权访问（非 admin/owner）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /api/v1/server/info:
     get:
       tags: [Server]
@@ -2320,10 +2447,15 @@ paths:
       summary: 标记频道已读（M16）
       description: |
         标记当前用户在该频道已读到指定消息。请求体可省略（等价 `{}`，SEC-001 允许空 body），
-        省略 lastMessageId 时服务端自动取频道最新一条。读到中间某条时传该条 ID：
+        省略 lastMessageId 时服务端自动取频道最新一条**主消息**（不含线程回复）。读到中间某条时传该条 ID：
         服务端按「该条之后的消息」继续计未读（定位点语义）。
         成功后服务端向本人所有连接广播 `unread_count_changed` 事件
         （payload 含 channelId/userId/unreadCount/mentionCount/firstUnreadMessageId，mark-read 后计数为 0、锚点为空串）。
+        线程已读（A9 二期）：请求体带 `threadParentId` 时只标记该线程——只 upsert 线程读位
+        （`message_thread_reads`），不推进频道水位、不广播 `unread_count_changed`，改为向本人广播
+        `thread_unread_changed` 归零形态（payload 含 channelId/parentId/unreadCount=0/lastReadMessageId）。
+        校验失败统一 404 `MESSAGE_NOT_FOUND`：①父消息不存在；②父消息不属于该频道；③该线程无可见回复。
+        响应 `data.message`：频道分支为 `marked as read`，线程分支为 `thread marked as read`。
         兼容说明：旧路由 `POST /api/v1/channels/{id}/read` 指向同一 handler，后续版本将移除。
       security:
       - BearerAuth: []
@@ -2339,6 +2471,14 @@ paths:
                   type: string
                   description: 已读位置的消息 ID；缺省取频道最新一条
                   example: msg_abc123
+                threadParentId:
+                  type: string
+                  description: |-
+                    A9 二期：可选。非空表示「标记该线程已读」——只写入线程已读位
+                    （message_thread_reads），不推进频道已读水位、不广播 unread_count_changed；
+                    校验 parent 存在 + 属于该频道 + 确有回复，失败统一 404 MESSAGE_NOT_FOUND。
+                    缺省时 lastMessageId 取频道最新主消息（不含线程回复）。
+                  example: msg_parent001
       responses:
         '200':
           description: 标记成功
@@ -2367,6 +2507,25 @@ paths:
                   value:
                     code: CHANNEL_ACCESS_DENIED
                     message: 频道访问被拒绝
+        '404':
+          description: |-
+            资源不存在，两种情形：
+            ①频道不存在/已删除 → `CHANNEL_NOT_FOUND`；
+            ②线程分支（带 threadParentId）校验失败统一 `MESSAGE_NOT_FOUND`：父消息不存在 / 父消息不属于该频道 / 该线程无可见回复（含回复已被全部删除或并发删除）。
+            客户端收到 404 应回退为「线程不存在/已清空」并刷新主列表。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                MESSAGENotFound:
+                  value:
+                    code: MESSAGE_NOT_FOUND
+                    message: 消息不存在
+                CHANNELNotFound:
+                  value:
+                    code: CHANNEL_NOT_FOUND
+                    message: 频道不存在
   /api/v1/channels/{id}/unread:
     parameters:
     - name: id
@@ -2379,7 +2538,14 @@ paths:
     get:
       tags: [Messages]
       summary: 获取未读消息统计
-      description: 获取指定频道的未读消息数量和@提及数量。
+      description: |
+        获取指定频道的未读消息数量、@提及数量与线程维度未读。
+        未读口径（A9 二期）：
+        - `unreadCount` 只计**顶层消息**（`parent_id IS NULL`，线程回复不再计入；仍保持旧行为的「不排除本人发言」）；
+        - `threadUnreads` 为线程维度独立未读：只计 `parent_id` 下的回复、**排除本人发言**，水位取
+          `COALESCE(线程已读位, 频道已读水位)`；按 `lastAt` 倒序、**最多 20 条**（cap20），无未读时为 `[]`；
+        - 旧字段（unreadCount/mentionCount/firstUnreadMessageId）语义不变，旧客户端忽略未知字段即可。
+        已知限制：>20 个线程同时有未读时 `threadUnreads` 只返回前 20 个（是否补汇总字段待定）。
       security:
       - BearerAuth: []
       - CookieAuth: []
@@ -2410,6 +2576,48 @@ paths:
                     nullable: true
                     description: 第一条未读消息ID
                     example: msg_first_unread_001
+                  threadUnreads:
+                    type: array
+                    description: 线程维度未读（A9 二期；旧客户端忽略未知字段），按 lastAt 倒序，最多 20 条；无未读时为 []
+                    items:
+                      type: object
+                      required: [parentId, count, lastAt]
+                      properties:
+                        parentId:
+                          type: string
+                          description: 父消息ID
+                          example: msg_parent001
+                        count:
+                          type: integer
+                          minimum: 0
+                          description: 该线程未读数（不含本人发言）
+                          example: 3
+                        lastAt:
+                          type: string
+                          format: date-time
+                          description: 该线程最后一条未读回复时间
+        '403':
+          description: 无频道访问权限
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                CHANNELAccessDenied:
+                  value:
+                    code: CHANNEL_ACCESS_DENIED
+                    message: 频道访问被拒绝
+        '404':
+          description: 频道不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                CHANNELNotFound:
+                  value:
+                    code: CHANNEL_NOT_FOUND
+                    message: 频道不存在
   /api/v1/channels/mutes:
     get:
       tags: [Channels]
@@ -4588,6 +4796,7 @@ paths:
         仅玩家可提交（观战者被拒绝）。action 取值：
         `game_start`（房主，从 waiting 开局）、`game_restart`（房主，「再来一局」，重置 state，设计 §15.3.4）、
         `move_made`/`roll_dice`/`move_pawn`/`bid`/`play`/`werewolf_kill`/`seer_check`/`vote`/`next_phase`（各引擎自行声明）。
+        日本麻将（`riichi`）：`discard`/`riichi`/`chi`/`pon`/`minkan`/`ankan`/`kakan`/`tsumo`/`ron`/`pass`/`kyushukyuhai`（payload：`{"tiles":["1m"],"called":"5p"}`，规则内核经 `features/minigames/riichi/core` 适配）。
       security: [BearerAuth: [], CookieAuth: []]
       requestBody:
         required: true
@@ -5226,14 +5435,62 @@ paths:
         description: 语音房间ID
       responses:
         '200':
-          description: OK
+          description: |-
+            OK。双模式：房间已设口令（E2EE 二期）返回 mode=passphrase 与 magic 校验
+            blob（永不返回 key）；未设口令返回 mode=server 与一期服务端分发密钥。
+            旧客户端兼容：无 mode 字段视为 server 模式。
           content:
             application/json:
               schema:
                 type: object
                 properties:
+                  mode:
+                    type: string
+                    enum:
+                    - server
+                    - passphrase
+                    description: 密钥协商模式（缺省视为 server，一期兼容）
                   key:
                     type: string
+                    description: 服务端分发的 hex 密钥（仅 mode=server 时存在）
+                  magic:
+                    type: string
+                    maxLength: 4096
+                    description: 口令校验 blob（base64(salt12||AES-GCM 密文)，仅 mode=passphrase 时存在；客户端本地用口令派生密钥解密校验）
+  /api/v1/voice/e2ee/passphrase:
+    put:
+      tags:
+      - Voice
+      summary: 设置/清除语音房间口令（E2EE 二期）
+      description: |-
+        仅 OWNER/ADMIN。body {roomId, magic}：magic 非空=启用口令模式（客户端本端
+        PBKDF2 派生后上传的 magic 校验 blob，口令永不出端）；null/空=清除并退回
+        一期 server 模式。口令房禁止录音。
+      security:
+      - BearerAuth: []
+      - CookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - roomId
+              properties:
+                roomId:
+                  type: string
+                  description: 语音房间ID
+                magic:
+                  type: string
+                  nullable: true
+                  maxLength: 4096
+                  description: magic 校验 blob；null/空 = 清除口令
+      responses:
+        '200':
+          description: 设置/清除成功
+        '403':
+          description: 非 OWNER/ADMIN
   /api/v1/voice/e2ee/key/rotate:
     post:
       tags:
@@ -6842,6 +7099,13 @@ components:
           maxLength: 4000
           description: 消息内容
           example: 大家好，今天有什么进展？
+        forwardFrom:
+          type: string
+          maxLength: 64
+          description: |-
+            转发来源作者显示名快照（消息转发功能）：空/缺省 = 非转发消息。
+            只存转发动作发生时源消息原作者的显示名，不存被转发消息引用，无转发链。
+          example: 张三
         type:
           type: string
           enum:
@@ -6877,7 +7141,7 @@ components:
         threadReplyCount:
           type: integer
           nullable: true
-          description: 线程回复数量
+          description: 线程回复数量（直接回复数，不含已软删除；A9 二期：顶层消息一律返回，无回复时为 0）
           example: 5
         createdAt:
           type: string
@@ -7567,6 +7831,22 @@ components:
           nullable: true
           description: 第一条未读消息ID
           example: msg_first_unread_001
+        threadUnreads:
+          type: array
+          description: 线程维度未读（A9 二期），按 lastAt 倒序，最多 20 条
+          items:
+            type: object
+            properties:
+              parentId:
+                type: string
+                example: msg_parent001
+              count:
+                type: integer
+                minimum: 0
+                example: 3
+              lastAt:
+                type: string
+                format: date-time
     StatusUpdateRequest:
       type: object
       required:
