@@ -51,7 +51,9 @@ const (
 type Config struct {
 	MatchType     string `json:"matchType"`     // east（默认）| south
 	StartingScore int    `json:"startingScore"` // 默认 25000
-	RedFives      bool   `json:"redFives"`      // 是否使用赤五（默认 true）
+	// RedFives 为 nil 表示「未显式配置」= 默认启用赤五（task-103）。
+	// 用指针而非 bool，才能区分「没配」与「显式关掉」。
+	RedFives *bool `json:"redFives,omitempty"`
 }
 
 // Normalize 返回补齐默认值后的配置。
@@ -63,6 +65,30 @@ func (c Config) Normalize() Config {
 	if out.StartingScore <= 0 {
 		out.StartingScore = 25000
 	}
+	if out.RedFives == nil {
+		out.RedFives = &defaultRedFives
+	}
+	return out
+}
+
+// defaultRedFives 是「未显式配置」时的赤五开关。
+//
+// Normalize 会把 nil 指向同一地址：归一化后的 Config 可安全按指针比较、
+// 也可幂等重复归一化（旧快照没有 redFives 字段 → nil → true，task-103）。
+var defaultRedFives = true
+
+// UseRedFives 返回是否启用赤五：未显式配置（nil）视为启用。
+func (c Config) UseRedFives() bool {
+	if c.RedFives == nil {
+		return true
+	}
+	return *c.RedFives
+}
+
+// WithRedFives 返回带显式赤五开关的配置副本（调用方/测试需要关闭赤五时使用）。
+func (c Config) WithRedFives(enabled bool) Config {
+	out := c
+	out.RedFives = &enabled
 	return out
 }
 
@@ -223,7 +249,7 @@ func wallFor(seed int64, index int, red bool) kyoku.Wall {
 
 // deal 按当前 pos/actions 重建当前手。
 func (m *Match) deal() error {
-	return m.dealWithWall(wallFor(m.seed, m.handIndex, m.cfg.RedFives))
+	return m.dealWithWall(wallFor(m.seed, m.handIndex, m.cfg.UseRedFives()))
 }
 
 func (m *Match) dealWithWall(w kyoku.Wall) error {
@@ -614,7 +640,16 @@ func (m *Match) decorateView(view map[string]interface{}, seat int) {
 	if m.finished {
 		view["winnerSeat"] = m.winnerSeat
 	}
-	if res, ok := m.LastHandResult(); ok && m.HandFinished() {
+	// handResult 下发窗口（task-93）：本手刚结算、下一手尚未有任何动作。
+	//
+	// 背景：settle() 会**立刻**发下一手（handIndex++、actions 清空），所以若只在
+	// `m.HandFinished()` 时下发，普通和牌永远拿不到 handResult —— 只有整场末手
+	// （m.finished，cur 仍是已结束的那一手）才满足，导致结算面板在常规对局中不渲染
+	// （task-79 录屏阻塞）。这里补一个「过渡态」判据：刚结算完的下一手 actions 必为空，
+	// 此时把上一手结算挂上去；下一手首个动作落库后 actions 非空，handResult 自然消失
+	// （结算面板关闭），无需客户端改动，也不改任何动作词表/字段名。
+	handJustSettled := len(m.history) > 0 && len(m.actions) == 0
+	if res, ok := m.LastHandResult(); ok && (m.HandFinished() || handJustSettled) {
 		view["handResult"] = res
 	}
 	view["history"] = m.history

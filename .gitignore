@@ -121,3 +121,10 @@ desktop.ini
 # Temporary
 *.tmp
 *.temp
+
+# 服务端控制台：构建产物与 WebView2 SDK 缓存（不提交二进制）
+tools/server-console/dist/
+tools/server-console/sdk/
+
+# Windows 版 LiveKit 二进制（下载得到，不入库；部署/打包时由 download-livekit-win.ps1 拉取）
+livekit/bin/windows-amd64/

@@ -24,7 +24,7 @@ func New() *Engine {
 const PlayTimeout = 30
 
 type card struct {
-	Rank  int    `json:"rank"`  // 3..17, 16=小王, 17=大王
+	Rank  int    `json:"rank"` // 3..17, 16=小王, 17=大王
 	Suit  string `json:"suit"`
 	Value string `json:"value"`
 }
@@ -235,6 +235,27 @@ func (e *Engine) SpectatorState(state map[string]interface{}) map[string]interfa
 		handCounts[uid] = len(hand)
 	}
 	delete(masked, "hands")
+	masked["handCounts"] = handCounts
+	return masked
+}
+
+// PlayerState 返回对局玩家视角的 state（task-109，RUBRIC 红线 #1）。
+// 与 SpectatorState 的差别：保留「本人」手牌明细，其余玩家只给剩余张数，
+// 避免玩家 curl 直读 getState 拿到三家手牌作弊；公共字段（phase/currentPlayer/
+// landlord/bottomCards/lastPlay/winner/pendingScore/universals/turnStartedAt 等）原样保留。
+// 客户端契约（ridgericetalk-win/src/renderer/components/games/DoudizhuGame.tsx:114-117）：
+// 本人手牌读 hands[myId]，其余玩家读 handCounts[uid]。
+func (e *Engine) PlayerState(state map[string]interface{}, userID string) map[string]interface{} {
+	masked := util.ShallowCopy(state)
+	hands := e.handsMap(state)
+	handCounts := make(map[string]int, len(hands))
+	for uid, hand := range hands {
+		handCounts[uid] = len(hand)
+	}
+	delete(masked, "hands")
+	if hand, ok := hands[userID]; ok {
+		masked["hands"] = map[string][]card{userID: hand}
+	}
 	masked["handCounts"] = handCounts
 	return masked
 }

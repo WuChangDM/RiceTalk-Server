@@ -7,6 +7,7 @@ import (
 	"hash"
 	"io"
 	"mime"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,47 @@ func (s *localStorage) URL(key string) string {
 	return s.baseURL + "/" + key
 }
 
+// FilesPathPrefix 是 files handler 对外提供上传/下载的路径前缀。
+const FilesPathPrefix = "/api/v1/files"
+
+// URLWithBase 用指定的对外 base 拼出文件的绝对 URL。
+//
+// base 为空时退回相对路径 "/api/v1/files/<key>"，与 URL() 的本地开发/单测口径一致；
+// base 末尾的斜杠会被裁掉，避免拼出 "//" 双斜杠。
+//
+// 为什么单独提供：localStorage.URL() 只有构造时传入的 baseURL，拿不到「本次请求实际
+// 使用的 host:port」；NAT / 预构建包部署下配置里的对外地址常缺端口（task-100：t46 的
+// RRT_PUBLIC_ADDRESS=http://t46.sjcmc.cn → 上传返回的 URL 缺 :21103，外网 502）。
+// 由 handler 依据请求信息构造 base 后走这里拼装，是零协议变更的最小侵入修法。
+func URLWithBase(key, base string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" {
+		return FilesPathPrefix + "/" + strings.TrimLeft(key, "/")
+	}
+	return base + "/" + strings.TrimLeft(key, "/")
+}
+
+// AbsoluteFilesBase 从配置的对外地址（RRT_PUBLIC_ADDRESS）推导文件 URL 的 base。
+//
+// 仅在地址是绝对 URL **且带显式端口**时返回 (base, true)：显式端口说明运维已写明对外
+// 入口，以配置为准。未带端口时返回 false，由调用方用请求 Host 兜底 —— 反代（443/80
+// 默认端口）与 NAT 端口映射两种场景的真实可达地址只能从请求得知，配置里猜端口（如恒定
+// 追加 RRT_PORT）反而会在反代部署下拼出不可达地址。
+func AbsoluteFilesBase(publicAddress string) (string, bool) {
+	addr := strings.TrimSpace(publicAddress)
+	if addr == "" {
+		return "", false
+	}
+	parsed, err := url.Parse(addr)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", false
+	}
+	if parsed.Port() == "" {
+		return "", false
+	}
+	return strings.TrimRight(parsed.Scheme+"://"+parsed.Host, "/") + FilesPathPrefix, true
+}
+
 // GenerateKey creates a unique storage key
 func GenerateKey(prefix, filename string) string {
 	// Generate a hash-based path for even distribution
@@ -174,28 +216,28 @@ func ValidateFileType(reader io.Reader, expectedTypes ...string) (string, bool) 
 
 	// Simple magic number checks
 	magicMap := map[string][][]byte{
-		"image/jpeg":      {{0xFF, 0xD8, 0xFF}},
-		"image/png":       {{0x89, 0x50, 0x4E, 0x47}},
-		"image/gif":       {{0x47, 0x49, 0x46}, {0x47, 0x49, 0x46}},
-		"image/webp":      {{0x52, 0x49, 0x46, 0x46}},
-		"image/avif":      {{0x00, 0x00, 0x00}},
-		"image/heic":      {{0x00, 0x00, 0x00}},
-		"image/heif":      {{0x00, 0x00, 0x00}},
-		"image/tiff":      {{0x49, 0x49, 0x2A, 0x00}, {0x4D, 0x4D, 0x00, 0x2A}},
-		"image/x-icon":    {{0x00, 0x00, 0x01, 0x00}},
-		"audio/mpeg":      {{0xFF, 0xFB}, {0xFF, 0xF3}, {0xFF, 0xF2}, {0x49, 0x44, 0x33}},
-		"audio/wav":       {{0x52, 0x49, 0x46, 0x46}},
-		"audio/ogg":       {{0x4F, 0x67, 0x67, 0x53}},
-		"video/mp4":       {{0x00, 0x00, 0x00}, {0x66, 0x74, 0x79, 0x70}},
-		"video/webm":      {{0x1A, 0x45, 0xDF, 0xA3}},
-		"video/quicktime": {{0x00, 0x00, 0x00}},
-		"video/x-msvideo": {{0x52, 0x49, 0x46, 0x46}},
+		"image/jpeg":       {{0xFF, 0xD8, 0xFF}},
+		"image/png":        {{0x89, 0x50, 0x4E, 0x47}},
+		"image/gif":        {{0x47, 0x49, 0x46}, {0x47, 0x49, 0x46}},
+		"image/webp":       {{0x52, 0x49, 0x46, 0x46}},
+		"image/avif":       {{0x00, 0x00, 0x00}},
+		"image/heic":       {{0x00, 0x00, 0x00}},
+		"image/heif":       {{0x00, 0x00, 0x00}},
+		"image/tiff":       {{0x49, 0x49, 0x2A, 0x00}, {0x4D, 0x4D, 0x00, 0x2A}},
+		"image/x-icon":     {{0x00, 0x00, 0x01, 0x00}},
+		"audio/mpeg":       {{0xFF, 0xFB}, {0xFF, 0xF3}, {0xFF, 0xF2}, {0x49, 0x44, 0x33}},
+		"audio/wav":        {{0x52, 0x49, 0x46, 0x46}},
+		"audio/ogg":        {{0x4F, 0x67, 0x67, 0x53}},
+		"video/mp4":        {{0x00, 0x00, 0x00}, {0x66, 0x74, 0x79, 0x70}},
+		"video/webm":       {{0x1A, 0x45, 0xDF, 0xA3}},
+		"video/quicktime":  {{0x00, 0x00, 0x00}},
+		"video/x-msvideo":  {{0x52, 0x49, 0x46, 0x46}},
 		"video/x-matroska": {{0x1A, 0x45, 0xDF, 0xA3}},
-		"video/x-flv":     {{0x46, 0x4C, 0x56}},
-		"video/mp2t":      {{0x47}},
-		"video/3gpp":      {{0x00, 0x00, 0x00}},
-		"application/pdf": {{0x25, 0x50, 0x44, 0x46}},
-		"application/zip": {{0x50, 0x4B, 0x03, 0x04}},
+		"video/x-flv":      {{0x46, 0x4C, 0x56}},
+		"video/mp2t":       {{0x47}},
+		"video/3gpp":       {{0x00, 0x00, 0x00}},
+		"application/pdf":  {{0x25, 0x50, 0x44, 0x46}},
+		"application/zip":  {{0x50, 0x4B, 0x03, 0x04}},
 	}
 
 	detectedType := ""

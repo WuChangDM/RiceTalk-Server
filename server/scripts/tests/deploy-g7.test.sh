@@ -58,7 +58,7 @@ assert_contains "$DRY" "── 校验计划 ──" "打印校验计划"
 assert_contains "$DRY" "SHA256SUMS" "声明包内校验文件"
 assert_contains "$DRY" "MANIFEST.txt" "声明内容清单"
 assert_contains "$DRY" "DRY-RUN 结束（未产生任何文件）" "结束语声明零落盘"
-assert_contains "$DRY" "版本: 0.4.0" "版本号从 core/version 解析"
+assert_contains "$DRY" "版本: 0.4.1" "版本号从 core/version 解析"
 
 # ---------- 3. 敏感/垃圾自检全 0（H-5） ----------
 hdr "3. 敏感与垃圾自检（必须全 0）"

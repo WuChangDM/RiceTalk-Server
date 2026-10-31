@@ -202,14 +202,18 @@ func TestRiichiPlayerStateCanContinuePlaying(t *testing.T) {
 		t.Fatalf("剥离 snapshot 后出牌应成功，实际 status=%d body=%s", w.Code, truncateForLog(w.Body.String()))
 	}
 
-	// 出牌后 currentPlayer 应推进到下一家（bob），证明对局在无 snapshot 的情况下仍能继续。
+	// 出牌后行动权应离开 alice，证明对局在无 snapshot 的情况下仍能继续。
+	//
+	// 注意：Init 的牌山 seed 取 time.Now()，随机手牌可能让别家在 alice 出牌后进入
+	// 鸣牌窗口（chi/pon/ron），此时 currentPlayer 是那个申告座位而非固定 bob，
+	// 因此只断言「不再是 alice 且非空」，不锁具体座位。
 	after := getStateRaw(t, r, "s-m14-play", "alice")
 	var afterState map[string]interface{}
 	if err := json.Unmarshal([]byte(after), &afterState); err != nil {
 		t.Fatalf("unmarshal after state failed: %v", err)
 	}
-	if cur, _ := afterState["currentPlayer"].(string); cur != "bob" {
-		t.Fatalf("alice 出牌后 currentPlayer 应为 bob，实际=%q", cur)
+	if cur, _ := afterState["currentPlayer"].(string); cur == "" || cur == "alice" {
+		t.Fatalf("alice 出牌后 currentPlayer 应离开 alice，实际=%q", cur)
 	}
 }
 

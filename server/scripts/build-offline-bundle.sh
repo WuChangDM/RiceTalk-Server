@@ -274,6 +274,35 @@ admin_dist_issues() { # $1=仓库根（便于测试注入临时目录）；返�
     return 0
 }
 
+# ---------- 发布门禁：包内不得出现默认 LiveKit 密钥（task-96） ----------
+# 背景：服务端 config 有 devkey/devsecret 默认回退；若把「已渲染的 livekit.yaml」
+# 打进离线包，等于让公开可知的默认密钥随包扩散。包内只允许 livekit.yaml.template
+# 且必须保留 {{LIVEKIT_API_KEY}} 占位符，由服务端首启按 .env 中的随机密钥渲染。
+assert_no_default_livekit_secrets() { # $1=bundle 根；返回不合格文件数
+    local root="$1" bad=0 f
+    while IFS= read -r -d '' f; do
+        if grep -Eq '(^|[^A-Za-z0-9_])(devkey|devsecret)([^A-Za-z0-9_]|$)' "$f" 2>/dev/null; then
+            printf '  ❌ 默认 LiveKit 密钥命中：%s\n' "${f#"$root"/}"
+            bad=$((bad + 1))
+        fi
+    done < <(find "$root" -type f \( -name 'livekit.yaml' -o -name 'livekit.yaml.*' \) -print0 2>/dev/null)
+    if (( bad > 0 )); then
+        printf '  修复：不要打包已渲染的 livekit.yaml；只带 livekit.yaml.template（占位符），由服务端首启按 .env 密钥渲染\n'
+        return "$bad"
+    fi
+    while IFS= read -r -d '' f; do
+        if ! grep -q '{{LIVEKIT_API_KEY}}' "$f" 2>/dev/null; then
+            printf '  ❌ livekit 模板缺少 {{LIVEKIT_API_KEY}} 占位符：%s\n' "${f#"$root"/}"
+            bad=$((bad + 1))
+        fi
+    done < <(find "$root" -type f -name 'livekit.yaml.template' -print0 2>/dev/null)
+    if (( bad > 0 )); then
+        return "$bad"
+    fi
+    printf '  ✅ 包内无默认 LiveKit 密钥（仅模板且占位符完好）\n'
+    return 0
+}
+
 # ---------- 发布门禁：linux/amd64 交叉编译 + 二进制平台/vcs 硬校验 ----------
 # 事故背景：首批离线包直接取本机 Windows 侧预编译件，把 PE/Mach-O 打进 Linux 包。
 BIN_NAMES=('ridgericetalk-server' 'ridgericetalk-migrate')
@@ -510,6 +539,9 @@ for _bin in "$PKG_ROOT/bundle/server/ridgericetalk-server" "$PKG_ROOT/bundle/ser
 done
 # 打包后门禁：对 bundle 内副本再验一次平台/vcs（防止复制过程被换包或排除规则误伤）
 gate_binaries "$PKG_ROOT/bundle/server" "打包后"
+# task-96：默认 LiveKit 密钥负向门禁（包内只许模板占位符，不许 devkey/devsecret）
+assert_no_default_livekit_secrets "$PKG_ROOT/bundle" \
+    || fail "离线包含默认 LiveKit 密钥（devkey/devsecret）→ 禁止打包（task-96）"
 
 # 3.2 offline-assets
 say "准备离线资产（offline-assets/）…"

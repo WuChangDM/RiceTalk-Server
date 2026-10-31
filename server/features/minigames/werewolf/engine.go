@@ -99,7 +99,9 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 		if role != "werewolf" {
 			return nil, util.ErrInvalidAction
 		}
-		var p struct{ Target string `json:"target"` }
+		var p struct {
+			Target string `json:"target"`
+		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, util.ErrInvalidAction
 		}
@@ -126,7 +128,9 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 		if e.roleOf(state, userID) != "seer" {
 			return nil, util.ErrInvalidAction
 		}
-		var p struct{ Target string `json:"target"` }
+		var p struct {
+			Target string `json:"target"`
+		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, util.ErrInvalidAction
 		}
@@ -150,7 +154,9 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 		if !util.Contains(alive, userID) {
 			return nil, util.ErrInvalidAction
 		}
-		var p struct{ Target string `json:"target"` }
+		var p struct {
+			Target string `json:"target"`
+		}
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return nil, util.ErrInvalidAction
 		}
@@ -195,6 +201,62 @@ func (e *Engine) SpectatorState(state map[string]interface{}) map[string]interfa
 	// 观战者只能看到存活名单、当前阶段与投票进度。
 	delete(masked, "roles")
 	delete(masked, "nightActions")
+	return masked
+}
+
+// PlayerState 返回对局玩家视角的 state（task-109，RUBRIC 红线 #1）。
+// 最小可见集（按游戏规则）：
+//   - roles：仅保留本人身份；本人是狼人时额外保留其他狼人的身份（狼队互知，战斗需要）。
+//   - nightActions：预言家只看到自己的查验结果（seerTarget/seerResult）；狼人只看到
+//     狼队刀口（werewolfTarget）；平民/其它角色一律看不到（夜间行动是私密信息）。
+//   - 其余公共字段（phase/day/alive/votes/currentPlayer/phaseStartedAt/phaseDurations 等）原样保留。
+//
+// 客户端契约（ridgericetalk-win/src/renderer/components/games/werewolf/）：
+//   - WerewolfGame.tsx:50 本人身份读 roles[myId]；
+//   - SeatRing.tsx:37 狼人互认只在 roles[uid]==='werewolf' 时高亮；
+//   - WerewolfGame.tsx:108-113 预言家读 nightActions.seerTarget/seerResult。
+func (e *Engine) PlayerState(state map[string]interface{}, userID string) map[string]interface{} {
+	masked := util.ShallowCopy(state)
+	myRole := e.roleOf(state, userID)
+
+	visibleRoles := make(map[string]string)
+	if myRole != "" {
+		visibleRoles[userID] = myRole
+	}
+	if myRole == string(roleWerewolf) {
+		for uid, role := range e.rolesMap(state) {
+			if uid != userID && role == string(roleWerewolf) {
+				visibleRoles[uid] = role
+			}
+		}
+	}
+	if len(visibleRoles) > 0 {
+		masked["roles"] = visibleRoles
+	} else {
+		delete(masked, "roles")
+	}
+
+	visibleActions := make(map[string]interface{})
+	if actions, ok := state["nightActions"].(map[string]interface{}); ok {
+		switch myRole {
+		case string(roleSeer):
+			if v, exists := actions["seerTarget"]; exists {
+				visibleActions["seerTarget"] = v
+			}
+			if v, exists := actions["seerResult"]; exists {
+				visibleActions["seerResult"] = v
+			}
+		case string(roleWerewolf):
+			if v, exists := actions["werewolfTarget"]; exists {
+				visibleActions["werewolfTarget"] = v
+			}
+		}
+	}
+	if len(visibleActions) > 0 {
+		masked["nightActions"] = visibleActions
+	} else {
+		delete(masked, "nightActions")
+	}
 	return masked
 }
 
@@ -250,6 +312,25 @@ func (e *Engine) roleOf(state map[string]interface{}, userID string) string {
 		}
 	}
 	return ""
+}
+
+// rolesMap 统一读取角色分配表，兼容内存态 map[string]string 与 JSON 往返后的
+// map[string]interface{}（PlayerState 需要遍历全部角色判断狼队队友）。
+func (e *Engine) rolesMap(state map[string]interface{}) map[string]string {
+	out := make(map[string]string)
+	switch roles := state["roles"].(type) {
+	case map[string]string:
+		for uid, role := range roles {
+			out[uid] = role
+		}
+	case map[string]interface{}:
+		for uid, v := range roles {
+			if role, ok := v.(string); ok {
+				out[uid] = role
+			}
+		}
+	}
+	return out
 }
 
 func (e *Engine) aliveSlice(state map[string]interface{}) []string {

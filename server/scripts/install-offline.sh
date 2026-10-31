@@ -306,4 +306,22 @@ if [[ "$SKIP_STATIC_CHECK" == "1" ]]; then
 else
     check_static_assets
 fi
+
+# ---------- 安装后守卫：LiveKit 默认密钥（task-96） ----------
+# 离线安装常见于「装一次用很久」的现场，默认密钥（devkey/devsecret）一旦对外开放
+# 就是公开可知的凭据。这里只读 .env.production 并告警 + 打印轮换命令，不自动改
+# （改密钥需要重启服务端/LiveKit，不应由安装脚本静默完成）。
+LK_HELPER="$(dirname "$DEPLOY_SCRIPT")/lib/livekit-keys.sh"
+LK_ENV_FILE="$DEPLOY_DIR/server/.env.production"
+if [[ -f "$LK_HELPER" && -f "$LK_ENV_FILE" ]]; then
+    # shellcheck source=lib/livekit-keys.sh
+    source "$LK_HELPER"
+    say "── LiveKit API 密钥自检（task-96）──"
+    LK_RC=0
+    lk_ensure_env_credentials "$LK_ENV_FILE" "" "${PORT_ADMIN:-9090}" || LK_RC=$?
+    if [[ "$LK_RC" == "2" ]]; then
+        say "⚠ 检测到默认 LiveKit 密钥：安装已完成，但请先按上面命令轮换，再对外开放语音"
+    fi
+fi
+
 exit 0

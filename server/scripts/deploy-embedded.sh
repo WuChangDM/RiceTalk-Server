@@ -64,6 +64,12 @@ rrt_ensure_go_on_path() {
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# task-96：LiveKit API 密钥助手（生成/幂等校验/轮换提示）。缺失时不影响部署主流程，
+# 只在环境配置阶段给出告警 —— 部署脚本本身的健壮性优先于新特性。
+if [[ -f "$SCRIPT_DIR/lib/livekit-keys.sh" ]]; then
+    # shellcheck source=lib/livekit-keys.sh
+    source "$SCRIPT_DIR/lib/livekit-keys.sh"
+fi
 DEPLOY_DIR="${DEPLOY_DIR:-/opt/ridgericetalk}"
 SERVER_DIR="$DEPLOY_DIR/server"
 WEB_DIR="$DEPLOY_DIR/web"
@@ -141,6 +147,10 @@ Options:
   --skip-frontend           跳过前端构建
   --skip-build              跳过后端构建（直接复制已有二进制）
   --force                   强制覆盖 .env.production
+  --rotate-livekit-keys     轮换 LiveKit API Key/Secret（task-96）：检测到默认值
+                            devkey/devsecret 时默认只告警+打印轮换命令；本开关才
+                            真正生成新值写回 .env.production（备份 .bak.<UTC>，
+                            需重启服务端生效；不改运行中实例）
   --allow-embedded-deps-download
                             离线安装下仍允许服务端启动期联网下载依赖（默认禁止）。
                             仅在确认目标机可出网时使用；否则无网机器会卡在下载。
@@ -171,6 +181,8 @@ while [[ $# -gt 0 ]]; do
         --skip-frontend) SKIP_FRONTEND=true; shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --force) FORCE=true; shift ;;
+        # task-96：显式轮换 LiveKit API 密钥（默认只告警，不自动改已有部署）。
+        --rotate-livekit-keys) ROTATE_LIVEKIT_KEYS=true; shift ;;
         # task-49：离线安装默认关闭运行期依赖下载；显式允许下载需本人签字式开关。
         --allow-embedded-deps-download) ALLOW_EMBEDDED_DEPS_DOWNLOAD=true; shift ;;
         *) fail "未知参数: $1"; show_help; exit 1 ;;
@@ -323,6 +335,22 @@ if [[ -z "$PUBLIC_ADDRESS" ]]; then
     else
         warn "非交互模式：已采用探测地址，可用 --public-address 覆盖"
         PUBLIC_ADDRESS="$DEFAULT_PUBLIC"
+    fi
+fi
+
+# task-100：RRT_PUBLIC_ADDRESS 必须带实际对外端口，否则服务端拼出的附件/文件 URL
+# 缺端口、外网打不开（t46 实测 502：http://t46.sjcmc.cn/... 应带 :21103）。
+# 规则与桌面部署脚本一致：
+#   1) 显式写了非默认端口 → 原样保留；
+#   2) http 且未写端口 → 补 API 端口（直连/预构建包，对外端口就是 PORT_API）；
+#   3) https 且未写端口 → 视为反代（443 对外），不补端口。
+if declare -F rrt_port_of_address &>/dev/null; then
+    _pub_addr="${PUBLIC_ADDRESS%/}"
+    _pub_scheme="${_pub_addr%%://*}"
+    _pub_port="$(rrt_port_of_address "$_pub_addr" 2>/dev/null || true)"
+    if [[ -z "$_pub_port" && "$_pub_scheme" == "http" ]]; then
+        PUBLIC_ADDRESS="${_pub_addr}:${PORT_API}"
+        info "对外地址未写端口，已按 API 端口补全：$PUBLIC_ADDRESS"
     fi
 fi
 
@@ -853,6 +881,31 @@ if [[ "$LK_USE_EXTERNAL_IP" == "false" && -f "$STORAGE_DIR/livekit.yaml" ]] \
    && grep -q 'use_external_ip: *true' "$STORAGE_DIR/livekit.yaml" 2>/dev/null; then
     warn "检测到已渲染的 $STORAGE_DIR/livekit.yaml 仍为 use_external_ip: true（渲染只发生一次，本次写入的覆盖行不会自动生效）"
     info "  如需修正语音：停止服务 → 删除该文件 → 重跑本脚本（或直接重启服务由服务端按新 env 重渲染）"
+fi
+
+# ============================================================
+# task-96：LiveKit 默认密钥守卫
+# 背景：config 有 devkey/devsecret 默认回退（server/internal/config/config.go）。
+#  - 新建 .env：上面已生成随机 RRT_LIVEKIT_API_KEY/SECRET，本段只做终检；
+#  - 已存在 .env（升级/重跑）：不自动改运行中的实例，只在检测到默认值时醒目
+#    WARN 并打印复制即用的轮换命令；显式 --rotate-livekit-keys 才写回新值。
+#  - livekit.yaml 由服务端启动时按 env 重写（livekitmgr.generateConfig），
+#    因此密钥一致性由「env 单一真源 + 重启」保证；外部 LiveKit 需人工同步 keys。
+# ============================================================
+if declare -F lk_ensure_env_credentials >/dev/null 2>&1 && [[ -f "$ENV_FILE" ]]; then
+    LK_ROTATE_ARG=""
+    [[ "${ROTATE_LIVEKIT_KEYS:-false}" == "true" ]] && LK_ROTATE_ARG="--rotate"
+    lk_ensure_env_credentials "$ENV_FILE" $LK_ROTATE_ARG "$PORT_API" || LK_GUARD_RC=$?
+    if [[ "${LK_GUARD_RC:-0}" == "2" ]]; then
+        warn "部署可以继续，但生产环境请尽快按上面的命令轮换（本次未改动运行中实例）"
+    elif [[ "${LK_GUARD_RC:-0}" == "1" ]]; then
+        warn "LiveKit 密钥守卫未能完成检查（可能缺少 openssl//dev/urandom 或 .env 不可写），请人工确认"
+    fi
+    if [[ -f "$STORAGE_DIR/livekit.yaml" ]] && declare -F lk_assert_no_default_in_yaml >/dev/null 2>&1; then
+        if ! lk_assert_no_default_in_yaml "$STORAGE_DIR/livekit.yaml"; then
+            warn "已渲染的 $STORAGE_DIR/livekit.yaml 仍含默认密钥；重启服务端后会按 .env 中的新密钥重写（外部 LiveKit 部署需手工同步 keys 段）"
+        fi
+    fi
 fi
 
 # ============================================================

@@ -28,6 +28,11 @@ func (e *Engine) Init(players []map[string]interface{}) (map[string]interface{},
 	return e.InitWithConfig(players, core.Config{})
 }
 
+// newMatchSeed 生成新对局的牌山 seed（必须 < 2^53，见 InitWithConfig 内注释）。
+//
+// 抽成包级变量仅为让测试注入固定 seed 做确定性断言；生产路径恒为 time.Now()。
+var newMatchSeed = func() int64 { return time.Now().UnixNano() & (core.MaxSeed - 1) }
+
 // InitWithConfig 用指定场制初始化（东/半庄），供建房时传入配置。
 func (e *Engine) InitWithConfig(players []map[string]interface{}, cfg core.Config) (map[string]interface{}, error) {
 	ids := util.PlayerUserIDs(players)
@@ -38,7 +43,7 @@ func (e *Engine) InitWithConfig(players []map[string]interface{}, cfg core.Confi
 
 	// seed 必须 < 2^53：session.State 以 JSON 存库、读回时数字变 float64，
 	// 超过尾数 53 位会被舍入 → 牌山不一致 → 偶发 invalid game action。
-	m, err := core.NewMatch(time.Now().UnixNano()&(core.MaxSeed-1), cfg)
+	m, err := core.NewMatch(newMatchSeed(), cfg)
 	if err != nil {
 		return nil, err
 	}

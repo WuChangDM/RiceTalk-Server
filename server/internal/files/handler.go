@@ -96,10 +96,39 @@ func (h *Handler) Upload(c *gin.Context) {
 	}
 
 	errors.Success(c, gin.H{
-		"url":      h.storage.URL(key),
+		"url":      storage.URLWithBase(key, h.publicFilesBase(c)),
 		"filename": header.Filename,
 		"size":     header.Size,
 	})
+}
+
+// publicFilesBase 返回上传响应里文件 URL 的对外 base（形如 http://host:port/api/v1/files）。
+//
+// 优先级（task-100）：
+//  1. 配置里的 RRT_PUBLIC_ADDRESS **带显式端口** → 以配置为准（运维已写明对外入口）；
+//  2. 否则用本次请求的 Host 兜底 —— NAT 端口映射 / 预构建包部署下，客户端实际访问的
+//     host:port 才是可达地址；配置缺端口时若在这里猜端口（恒定追加 RRT_PORT），反代
+//     （443/80）部署会拼出不可达地址；
+//  3. Host 也为空（极少数直连测试）→ 返回空串，storage.URLWithBase 退回相对路径，保持
+//     本地开发/单测的既有口径。
+func (h *Handler) publicFilesBase(c *gin.Context) string {
+	if h.cfg != nil {
+		if base, ok := storage.AbsoluteFilesBase(h.cfg.PublicAddress); ok {
+			return base
+		}
+	}
+	host := strings.TrimSpace(c.Request.Host)
+	if host == "" {
+		return ""
+	}
+	scheme := "http"
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
+	if proto := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); proto != "" {
+		scheme = strings.ToLower(strings.TrimSpace(strings.Split(proto, ",")[0]))
+	}
+	return scheme + "://" + host + storage.FilesPathPrefix
 }
 
 // Download handles file download
