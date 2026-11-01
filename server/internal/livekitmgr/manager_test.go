@@ -1,6 +1,7 @@
 package livekitmgr
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -259,7 +260,7 @@ func TestStartWithAutoStartDisabled(t *testing.T) {
 		LocalDataPath:    t.TempDir(),
 	}
 
-	if err := m.Start(cfg); err != nil {
+	if err := m.Start(context.Background(), cfg); err != nil {
 		t.Fatalf("Start with auto-start disabled should not error, got %v", err)
 	}
 	if m.started {
@@ -299,7 +300,7 @@ func TestStartWithMissingBinaryIsNonFatal(t *testing.T) {
 	}
 
 	// Missing binary should be non-fatal (returns nil, logs warning)
-	if err := m.Start(cfg); err != nil {
+	if err := m.Start(context.Background(), cfg); err != nil {
 		t.Errorf("Start with missing binary should be non-fatal, got error: %v", err)
 	}
 	if m.started {

@@ -89,7 +89,10 @@ type App struct {
 // NewApp loads config, initializes all dependencies and returns a runnable App.
 // The supplied exitFunc is installed on the logger so that log.Fatal behaves
 // the same as in the previous cmd/server/main.go implementation.
-func NewApp(cfg *config.Config, exitFunc func(int)) (*App, error) {
+//
+// ctx 用于约束启动阶段的内嵌依赖下载（LiveKit/FFmpeg）：进程被中断时下载会
+// 及时取消，不会留下无上限的挂起请求（AGENTS.md 硬规则 4）。
+func NewApp(ctx context.Context, cfg *config.Config, exitFunc func(int)) (*App, error) {
 	// Wire runtime-configurable security parameters
 	crypto.SetBcryptCost(cfg.BcryptCost)
 
@@ -109,7 +112,7 @@ func NewApp(cfg *config.Config, exitFunc func(int)) (*App, error) {
 
 	// Start LiveKit subprocess (auto-discover, auto-config, auto-restart)
 	lkMgr := livekitmgr.New(log)
-	if err := lkMgr.Start(cfg); err != nil {
+	if err := lkMgr.Start(ctx, cfg); err != nil {
 		if cfg.Env == "production" {
 			log.Fatal("failed to start livekit", "error", err)
 		} else {
@@ -124,7 +127,7 @@ func NewApp(cfg *config.Config, exitFunc func(int)) (*App, error) {
 	}
 
 	// Resolve FFmpeg binaries (PATH or embedded download) for music bot/TTS.
-	if err := thirdparty.ResolveFFmpeg(cfg, func(msg string, args ...any) {
+	if err := thirdparty.ResolveFFmpeg(ctx, cfg, func(msg string, args ...any) {
 		log.Info(fmt.Sprintf(msg, args...))
 	}); err != nil {
 		log.Warn("ffmpeg resolution failed, music bot and TTS may be unavailable", "error", err)

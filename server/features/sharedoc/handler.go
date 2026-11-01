@@ -23,6 +23,16 @@ import (
 // excessive memory usage and slow diff/version operations.
 const maxDocContentLen = 1024 * 1024 // 1 MB
 
+// 共享文档协作者角色（1.9.4 A 方案）。owner 不入 shared_document_collaborators
+// 表（表名即 GORM 默认名，见 migrations/000045 与 migration_table_name_test.go）：
+// 文档创建者由 SharedDocument.OwnerID 承载，恒有全部权限；表内只存被邀请的
+// editor（可改标题/内容）与 viewer（只读）。
+const (
+	sharedocRoleOwner  = "owner"
+	sharedocRoleEditor = "editor"
+	sharedocRoleViewer = "viewer"
+)
+
 // Handler handles shared document HTTP requests
 type Handler struct {
 	db        *gorm.DB
@@ -61,8 +71,11 @@ func (h *Handler) RegisterRoutes(r *gin.RouterGroup) {
 		sd.POST("/:id/versions/:versionNo/restore", h.RestoreVersion)
 		// Phase 2: 版本对比
 		sd.GET("/:id/versions/compare", h.CompareVersions)
-		// M23: 协同编辑 - 在线编辑者列表
+		// M23: 协同编辑 - 协作者/在线编辑者列表
 		sd.GET("/:id/editors", h.GetEditors)
+		// 1.9.4 A 方案：协作者增删（仅文档 owner；editor 只影响写权限，不能管理协作者）
+		sd.POST("/:id/editors", h.AddCollaborator)
+		sd.DELETE("/:id/editors/:userId", h.RemoveCollaborator)
 		// Phase 2: 文档评论
 		sd.GET("/:id/comments", h.ListComments)
 		sd.POST("/:id/comments", h.CreateComment)
@@ -109,9 +122,9 @@ func (h *Handler) List(c *gin.Context) {
 		}
 		for _, u := range users {
 			usernameMap[u.ID] = u.DisplayName
-if usernameMap[u.ID] == "" {
-	usernameMap[u.ID] = u.Username
-}
+			if usernameMap[u.ID] == "" {
+				usernameMap[u.ID] = u.Username
+			}
 		}
 	}
 
@@ -252,7 +265,7 @@ func (h *Handler) Update(c *gin.Context) {
 		errors.JSONError(c, errors.New(errors.SHAREDOC_NOT_FOUND, "document not found"))
 		return
 	}
-	if !h.canEditDoc(c, &doc) {
+	if !h.requireEdit(c, &doc) {
 		errors.JSONError(c, errors.New(errors.SHAREDOC_PERMISSION_DENIED, "no permission to operate this document"))
 		return
 	}
@@ -339,7 +352,8 @@ func (h *Handler) Delete(c *gin.Context) {
 		errors.JSONError(c, errors.New(errors.SHAREDOC_NOT_FOUND, "document not found"))
 		return
 	}
-	if !h.canEditDoc(c, &doc) {
+	// 删除文档是破坏性操作：仅 owner（或服务器管理员），editor 不行（1.9.4）。
+	if !h.requireOwner(c, &doc) {
 		errors.JSONError(c, errors.New(errors.SHAREDOC_PERMISSION_DENIED, "no permission to operate this document"))
 		return
 	}
@@ -407,9 +421,9 @@ func (h *Handler) ListVersions(c *gin.Context) {
 		if err := h.db.Select("id, display_name, username").Where("id IN ?", editorIDs).Find(&users).Error; err == nil {
 			for _, u := range users {
 				usernameMap[u.ID] = u.DisplayName
-if usernameMap[u.ID] == "" {
-	usernameMap[u.ID] = u.Username
-}
+				if usernameMap[u.ID] == "" {
+					usernameMap[u.ID] = u.Username
+				}
 			}
 		}
 	}
@@ -475,7 +489,8 @@ func (h *Handler) RestoreVersion(c *gin.Context) {
 		errors.JSONError(c, errors.New(errors.SHAREDOC_NOT_FOUND, "document not found"))
 		return
 	}
-	if !h.canEditDoc(c, &doc) {
+	// 恢复历史版本同样属于破坏性操作：仅 owner（或服务器管理员），editor 不行。
+	if !h.requireOwner(c, &doc) {
 		errors.JSONError(c, errors.New(errors.SHAREDOC_PERMISSION_DENIED, "no permission to restore version"))
 		return
 	}
@@ -545,8 +560,21 @@ func (h *Handler) RestoreVersion(c *gin.Context) {
 	})
 }
 
-// GetEditors returns the list of users currently editing a document (M23)
+// GetEditors 返回文档的协作者清单（1.9.4 A 方案起语义为「协作者」）。
+//
 // GET /sharedoc/:id/editors
+//
+// 相对 M23 的「在线编辑者」变更：此前 editors 数组来自 handler 内存里的 WS
+// 会话（doc_editor_joined/left），只反映「此刻谁正在编辑」且没有角色。1.9.4
+// 起改为持久化的协作者清单（owner 恒在首位），元素含：
+//   - userId / username：不变；
+//   - role：owner | editor | viewer（新增，供邀请 UI 展示与权限说明）；
+//   - online：此刻是否有在线编辑会话（保留原 M23 语义，前端可用于区分
+//     「正在编辑」与「仅被授权」）；
+//   - joinedAt：成为协作者的时间（owner 为文档创建时间；语义由「接入编辑
+//     会话时间」改为「授权时间」，旧前端仅展示不参与逻辑）。
+//
+// 字段只增不删：旧客户端读 userId/username/joinedAt 并过滤自身，行为不崩。
 func (h *Handler) GetEditors(c *gin.Context) {
 	id := c.Param("id")
 
@@ -561,49 +589,172 @@ func (h *Handler) GetEditors(c *gin.Context) {
 		return
 	}
 
-	h.mu.RLock()
-	userSet, ok := h.editors[id]
-	h.mu.RUnlock()
-
-	if !ok || len(userSet) == 0 {
-		errors.Success(c, gin.H{"docId": id, "editors": []interface{}{}, "count": 0})
+	var collabs []model.SharedDocumentCollaborator
+	if err := h.db.Where("doc_id = ?", id).Order("created_at ASC, id ASC").Find(&collabs).Error; err != nil {
+		errors.JSONError(c, errors.ErrInternal)
 		return
 	}
 
-	// 批量查询用户名
-	h.mu.RLock()
-	userIDs := make([]string, 0, len(userSet))
-	for uid := range userSet {
-		userIDs = append(userIDs, uid)
+	// 一次性批量查用户名（owner + 全部协作者），避免 N+1。
+	userIDs := make([]string, 0, len(collabs)+1)
+	userIDs = append(userIDs, doc.OwnerID)
+	for _, collab := range collabs {
+		if collab.UserID != doc.OwnerID {
+			userIDs = append(userIDs, collab.UserID)
+		}
 	}
-	snapshot := make(map[string]time.Time, len(userSet))
-	for k, v := range userSet {
-		snapshot[k] = v
+	usernameMap := h.usernamesByID(userIDs)
+
+	// 在线编辑会话（M23 内存态）只用于填充 online 字段，不决定列表成员。
+	h.mu.RLock()
+	onlineSet := make(map[string]bool, len(h.editors[id]))
+	for uid := range h.editors[id] {
+		onlineSet[uid] = true
 	}
 	h.mu.RUnlock()
 
-	var users []model.User
-	usernameMap := make(map[string]string)
-	if len(userIDs) > 0 {
-		if err := h.db.Select("id, display_name, username").Where("id IN ?", userIDs).Find(&users).Error; err == nil {
-			for _, u := range users {
-				usernameMap[u.ID] = u.DisplayName
-if usernameMap[u.ID] == "" {
-	usernameMap[u.ID] = u.Username
-}
-			}
+	editors := make([]gin.H, 0, len(collabs)+1)
+	editors = append(editors, gin.H{
+		"userId":   doc.OwnerID,
+		"username": usernameMap[doc.OwnerID],
+		"role":     sharedocRoleOwner,
+		"online":   onlineSet[doc.OwnerID],
+		"joinedAt": doc.CreatedAt.Format(time.RFC3339),
+	})
+	for _, collab := range collabs {
+		// owner 恒为 owner：表里若有同 user 的历史行不降级展示。
+		if collab.UserID == doc.OwnerID {
+			continue
 		}
-	}
-
-	editors := make([]gin.H, 0, len(snapshot))
-	for uid, joinedAt := range snapshot {
 		editors = append(editors, gin.H{
-			"userId":   uid,
-			"username": usernameMap[uid],
-			"joinedAt": joinedAt.Format(time.RFC3339),
+			"userId":   collab.UserID,
+			"username": usernameMap[collab.UserID],
+			"role":     collab.Role,
+			"online":   onlineSet[collab.UserID],
+			"joinedAt": collab.CreatedAt.Format(time.RFC3339),
 		})
 	}
 	errors.Success(c, gin.H{"docId": id, "editors": editors, "count": len(editors)})
+}
+
+// AddCollaborator 邀请同空间成员成为文档协作者（1.9.4 A 方案，仅 owner）。
+//
+// POST /sharedoc/:id/editors  body {"userId":"user-x","role":"editor|viewer"}
+// role 缺省 = editor；重复邀请幂等，仅按 role 覆盖（(doc_id,user_id) 唯一）。
+func (h *Handler) AddCollaborator(c *gin.Context) {
+	id := c.Param("id")
+
+	var body struct {
+		UserID string `json:"userId"`
+		Role   string `json:"role"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		errors.JSONError(c, errors.ErrBadRequest.WithDetails("invalid request body"))
+		return
+	}
+	body.UserID = strings.TrimSpace(body.UserID)
+	body.Role = strings.TrimSpace(body.Role)
+	if body.Role == "" {
+		body.Role = sharedocRoleEditor
+	}
+	if body.UserID == "" {
+		errors.JSONError(c, errors.ErrBadRequest.WithDetails("userId is required"))
+		return
+	}
+	if body.Role != sharedocRoleEditor && body.Role != sharedocRoleViewer {
+		errors.JSONError(c, errors.ErrBadRequest.WithDetails("role must be editor or viewer"))
+		return
+	}
+
+	doc := h.loadDocForOwner(c, id)
+	if doc == nil {
+		return
+	}
+
+	// owner 恒有全部权限，不入表（迁移只存 editor/viewer）；把自己加为协作者
+	// 属于无效请求，直接 400 而不是静默成功。
+	if body.UserID == doc.OwnerID {
+		errors.JSONError(c, errors.ErrBadRequest.WithDetails("document owner already has full access"))
+		return
+	}
+
+	// 目标必须是「存在的用户」且「本空间成员」：否则等于把文档授权给不存在
+	// 或空间外的人，泄露内容。用户不存在 → 404 USER_NOT_FOUND；非成员 → 400。
+	var target model.User
+	if err := h.db.Select("id").First(&target, "id = ?", body.UserID).Error; err != nil {
+		errors.JSONError(c, errors.New(errors.USER_NOT_FOUND, "user not found"))
+		return
+	}
+	var membership model.Membership
+	if err := h.db.Where("user_id = ? AND space_id = ?", body.UserID, doc.SpaceID).First(&membership).Error; err != nil {
+		errors.JSONError(c, errors.ErrBadRequest.WithDetails("target user is not a member of this space"))
+		return
+	}
+
+	var existing model.SharedDocumentCollaborator
+	err := h.db.Where("doc_id = ? AND user_id = ?", doc.ID, body.UserID).First(&existing).Error
+	switch {
+	case err == nil:
+		// 已授权：幂等更新角色（viewer ⇄ editor），不新建行。
+		if existing.Role != body.Role {
+			if err := h.db.Model(&model.SharedDocumentCollaborator{}).
+				Where("id = ?", existing.ID).
+				Update("role", body.Role).Error; err != nil {
+				errors.JSONError(c, errors.ErrInternal)
+				return
+			}
+		}
+	case err == gorm.ErrRecordNotFound:
+		collab := model.SharedDocumentCollaborator{
+			ID:     idgen.GenerateID(idgen.PrefixDoc),
+			DocID:  doc.ID,
+			UserID: body.UserID,
+			Role:   body.Role,
+		}
+		if err := h.db.Create(&collab).Error; err != nil {
+			errors.JSONError(c, errors.ErrInternal)
+			return
+		}
+	default:
+		errors.JSONError(c, errors.ErrInternal)
+		return
+	}
+
+	errors.Success(c, gin.H{
+		"docId":  doc.ID,
+		"userId": body.UserID,
+		"role":   body.Role,
+	})
+}
+
+// RemoveCollaborator 撤销文档协作者（仅 owner）。不能移除 owner 自己。
+//
+// DELETE /sharedoc/:id/editors/:userId
+func (h *Handler) RemoveCollaborator(c *gin.Context) {
+	id := c.Param("id")
+	targetUserID := c.Param("userId")
+
+	doc := h.loadDocForOwner(c, id)
+	if doc == nil {
+		return
+	}
+	if targetUserID == doc.OwnerID {
+		errors.JSONError(c, errors.ErrBadRequest.WithDetails("cannot remove the document owner"))
+		return
+	}
+
+	res := h.db.Where("doc_id = ? AND user_id = ?", doc.ID, targetUserID).
+		Delete(&model.SharedDocumentCollaborator{})
+	if res.Error != nil {
+		errors.JSONError(c, errors.ErrInternal)
+		return
+	}
+	if res.RowsAffected == 0 {
+		errors.JSONError(c, errors.New(errors.SHAREDOC_NOT_FOUND, "collaborator not found"))
+		return
+	}
+
+	errors.Success(c, gin.H{"docId": doc.ID, "userId": targetUserID, "message": "collaborator removed"})
 }
 
 // AddEditor marks a user as currently editing a document (M23)
@@ -722,11 +873,86 @@ func (h *Handler) canAccessDoc(c *gin.Context, doc *model.SharedDocument) bool {
 	return err == nil
 }
 
-// canEditDoc checks whether the current user can modify/delete/restore the document.
-// Only the document owner or space admins can edit.
-func (h *Handler) canEditDoc(c *gin.Context, doc *model.SharedDocument) bool {
+// requireOwner 判断当前用户是否是文档 owner（或服务器级管理员）。
+//
+// 1.9.4 A 方案：owner 拥有全部权限，且是唯一能管理协作者、删除文档、
+// 恢复历史版本的人。此前这三件事共用 canEditDoc（仅 owner/admin），
+// 现拆成 requireOwner / requireEdit 两个语义清晰的小函数，避免以后
+// 「editor 能改内容」被误扩散到破坏性操作上。
+func (h *Handler) requireOwner(c *gin.Context, doc *model.SharedDocument) bool {
 	userID := middleware.GetUserID(c)
 	return doc.OwnerID == userID || middleware.IsAdmin(c)
+}
+
+// requireEdit 判断当前用户能否修改文档内容（PATCH /sharedoc/:id）。
+//
+// 规则：owner/admin 恒可；被授权为 editor 的协作者可；viewer 与其他人不可。
+// 每次判定都查库（而非缓存），保证「被移除的 editor 下一次请求立刻 403」。
+func (h *Handler) requireEdit(c *gin.Context, doc *model.SharedDocument) bool {
+	if h.requireOwner(c, doc) {
+		return true
+	}
+	return h.collaboratorRole(c, doc) == sharedocRoleEditor
+}
+
+// collaboratorRole 返回当前用户在该文档上的协作者角色，未授权返回空串。
+func (h *Handler) collaboratorRole(c *gin.Context, doc *model.SharedDocument) string {
+	userID := middleware.GetUserID(c)
+	if userID == "" || h.db == nil {
+		return ""
+	}
+	var role string
+	err := h.db.Model(&model.SharedDocumentCollaborator{}).
+		Where("doc_id = ? AND user_id = ?", doc.ID, userID).
+		Limit(1).
+		Pluck("role", &role).Error
+	if err != nil {
+		return ""
+	}
+	return role
+}
+
+// loadDocForOwner 加载文档并校验「当前用户是 owner」。
+//
+// 供 AddCollaborator / RemoveCollaborator 复用：文档不存在 → 404
+// SHAREDOC_NOT_FOUND；无管理权限 → 403 SHAREDOC_PERMISSION_DENIED。
+// 失败时已写出响应并返回 nil，调用方直接 return。
+func (h *Handler) loadDocForOwner(c *gin.Context, id string) *model.SharedDocument {
+	var doc model.SharedDocument
+	if err := h.db.Where("id = ?", id).First(&doc).Error; err != nil {
+		errors.JSONError(c, errors.New(errors.SHAREDOC_NOT_FOUND, "document not found"))
+		return nil
+	}
+	if !h.requireOwner(c, &doc) {
+		errors.JSONError(c, errors.New(errors.SHAREDOC_PERMISSION_DENIED, "only the document owner can manage collaborators"))
+		return nil
+	}
+	return &doc
+}
+
+// usernamesByID 批量取用户展示名（display_name 为空时回退 username）。
+//
+// 批量而非逐条查询，避免协作者列表出现 N+1；失败时返回空 map，调用方
+// 展示空用户名而不是整体报错（列表可用性优先）。
+func (h *Handler) usernamesByID(ids []string) map[string]string {
+	out := make(map[string]string, len(ids))
+	if h.db == nil || len(ids) == 0 {
+		return out
+	}
+	var users []model.User
+	if err := h.db.Select("id, display_name, username").
+		Where("id IN ?", ids).
+		Find(&users).Error; err != nil {
+		return out
+	}
+	for _, u := range users {
+		name := u.DisplayName
+		if name == "" {
+			name = u.Username
+		}
+		out[u.ID] = name
+	}
+	return out
 }
 
 // spaceMemberIDs 查询空间全部成员的用户 ID（空间创建者在建空间时已写入
@@ -883,9 +1109,9 @@ func (h *Handler) ListComments(c *gin.Context) {
 		if err := h.db.Select("id, display_name, username").Where("id IN ?", userIDs).Find(&users).Error; err == nil {
 			for _, u := range users {
 				usernameMap[u.ID] = u.DisplayName
-if usernameMap[u.ID] == "" {
-	usernameMap[u.ID] = u.Username
-}
+				if usernameMap[u.ID] == "" {
+					usernameMap[u.ID] = u.Username
+				}
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package livekitmgr
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -115,7 +116,7 @@ func TestStartFullFlowWithTrueBinary(t *testing.T) {
 		Env:               "development",
 	}
 
-	if err := m.Start(cfg); err != nil {
+	if err := m.Start(context.Background(), cfg); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
 	if !m.started {
@@ -195,7 +196,7 @@ func TestStartWithAutostartTrueEnvVar(t *testing.T) {
 	}
 
 	// Missing binary should be non-fatal (returns nil).
-	if err := m.Start(cfg); err != nil {
+	if err := m.Start(context.Background(), cfg); err != nil {
 		t.Errorf("Start should not error with missing binary, got: %v", err)
 	}
 	if m.started {
@@ -226,7 +227,7 @@ func TestStartUsesExplicitBinaryPath(t *testing.T) {
 		Env:               "development",
 	}
 
-	err := m.Start(cfg)
+	err := m.Start(context.Background(), cfg)
 	if err == nil {
 		t.Fatal("expected Start to fail with non-existent explicit binary path")
 	}

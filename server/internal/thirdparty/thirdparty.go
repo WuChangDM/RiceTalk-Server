@@ -7,14 +7,18 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 
@@ -62,7 +66,10 @@ func PlatformKey() string {
 // ResolveFFmpeg resolves the ffmpeg and ffprobe executable paths for the given
 // configuration. It honors explicit paths, then PATH, and finally downloads the
 // pinned binaries when embedded dependency management is enabled.
-func ResolveFFmpeg(cfg *config.Config, log func(string, ...any)) error {
+//
+// ctx 用于约束内嵌二进制下载（见 downloadFile）：调用方必须传入可取消的上下文，
+// 进程退出/启动被中断时下载会及时停止，避免留下无上限的挂起请求。
+func ResolveFFmpeg(ctx context.Context, cfg *config.Config, log func(string, ...any)) error {
 	if cfg.FFmpegBinaryPath != "" && cfg.FFprobeBinaryPath != "" {
 		if exists(cfg.FFmpegBinaryPath) && exists(cfg.FFprobeBinaryPath) {
 			return nil
@@ -94,7 +101,7 @@ func ResolveFFmpeg(cfg *config.Config, log func(string, ...any)) error {
 		return fmt.Errorf("load embedded versions: %w", err)
 	}
 
-	binDir, err := EnsureFFmpeg(versions, cfg.ThirdPartyDir, log)
+	binDir, err := EnsureFFmpeg(ctx, versions, cfg.ThirdPartyDir, log)
 	if err != nil {
 		return fmt.Errorf("ensure ffmpeg: %w", err)
 	}
@@ -116,7 +123,7 @@ func ResolveFFmpeg(cfg *config.Config, log func(string, ...any)) error {
 
 // EnsureLiveKit ensures the LiveKit server binary exists at the given path,
 // downloading it if necessary.
-func EnsureLiveKit(versions *Versions, installDir string, log func(string, ...any)) (string, error) {
+func EnsureLiveKit(ctx context.Context, versions *Versions, installDir string, log func(string, ...any)) (string, error) {
 	exeName := "livekit-server"
 	if runtime.GOOS == "windows" {
 		exeName = "livekit-server.exe"
@@ -138,7 +145,7 @@ func EnsureLiveKit(versions *Versions, installDir string, log func(string, ...an
 		return "", fmt.Errorf("create livekit install dir: %w", err)
 	}
 
-	tmpFile, err := downloadFile(binary.URL, log)
+	tmpFile, err := downloadFile(ctx, binary.URL, log)
 	if err != nil {
 		return "", fmt.Errorf("download LiveKit: %w", err)
 	}
@@ -179,7 +186,7 @@ func EnsureLiveKit(versions *Versions, installDir string, log func(string, ...an
 
 // EnsureFFmpeg ensures FFmpeg and ffprobe binaries exist, downloading them if
 // necessary. It returns the directory containing the binaries.
-func EnsureFFmpeg(versions *Versions, installDir string, log func(string, ...any)) (string, error) {
+func EnsureFFmpeg(ctx context.Context, versions *Versions, installDir string, log func(string, ...any)) (string, error) {
 	binDir := filepath.Join(installDir, "ffmpeg", "bin")
 
 	ffmpegName := "ffmpeg"
@@ -232,7 +239,7 @@ func EnsureFFmpeg(versions *Versions, installDir string, log func(string, ...any
 		tmpFile, ok := downloaded[a.binary.URL]
 		if !ok {
 			var err error
-			tmpFile, err = downloadFile(a.binary.URL, log)
+			tmpFile, err = downloadFile(ctx, a.binary.URL, log)
 			if err != nil {
 				return "", fmt.Errorf("download %s: %w", a.name, err)
 			}
@@ -283,21 +290,144 @@ func exists(path string) bool {
 	return err == nil
 }
 
-func downloadFile(url string, log func(string, ...any)) (string, error) {
-	resp, err := http.Get(url)
+// 内嵌依赖下载的边界参数（AGENTS.md 硬规则 4：跨网络调用必须有超时、上限与
+// 有界重试）。
+const (
+	// downloadTimeout 是单次下载请求的总时限。FFmpeg 包较大（~80MB），慢速
+	// 自托管线路也要能下完，所以给到 30 分钟；注意这里**不设 http.Client.Timeout**
+	// （那会对整个 body 读取生效，慢网必被砍），而是用请求级 context 控制。
+	downloadTimeout = 30 * time.Minute
+	// downloadMaxBytes 是单次下载的大小上限（512MiB）。超过即失败，防止误连到
+	// 返回巨大响应的镜像或被中间人塞垃圾流量。
+	downloadMaxBytes = int64(512) << 20
+	// downloadAttempts 是总尝试次数（含首次），仅对可重试错误生效。
+	downloadAttempts = 3
+	// downloadRetryBase 是退避基数：1s、2s（指数退避）。
+	downloadRetryBase = time.Second
+)
+
+// downloadHTTPClient 是内嵌依赖下载专用 client。
+//
+// 不设 Client.Timeout（大文件慢网会被整段砍断），改为分项超时：建连 10s、
+// TLS 握手 15s、等待响应头 30s、空闲连接 90s；整体时长由请求级 context 兜底。
+var downloadHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	},
+}
+
+// httpStatusError 让重试判定能区分 4xx（不重试）与 429/5xx（可重试）。
+type httpStatusError struct {
+	code int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d", e.code)
+}
+
+// errDownloadTooLarge 表示响应体超过 downloadMaxBytes，属于不可重试错误。
+var errDownloadTooLarge = errors.New("download exceeds size limit")
+
+// isRetryableDownloadErr 判定错误是否值得重试：网络层错误、超时、429、5xx 可重试；
+// 4xx（除 429）、超过大小上限、本地写文件失败不重试。
+func isRetryableDownloadErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errDownloadTooLarge) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.code == http.StatusTooManyRequests || statusErr.code >= 500
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
+}
+
+// downloadFile 把 url 下载到临时文件并返回其路径。
+//
+// 规则 4：请求带 context（总时限 downloadTimeout）、大小上限 downloadMaxBytes、
+// 最多 downloadAttempts 次指数退避重试（4xx 不重试）；任何失败路径都会删除临时文件。
+func downloadFile(ctx context.Context, url string, log func(string, ...any)) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= downloadAttempts; attempt++ {
+		path, err := downloadFileOnce(ctx, url, log)
+		if err == nil {
+			return path, nil
+		}
+		lastErr = err
+		if !isRetryableDownloadErr(err) {
+			return "", err
+		}
+		if attempt == downloadAttempts {
+			break
+		}
+		delay := downloadRetryBase << (attempt - 1)
+		if log != nil {
+			log("[thirdparty] download attempt %d/%d failed: %v; retrying in %s", attempt, downloadAttempts, err, delay)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return "", lastErr
+}
+
+// downloadFileOnce 是单次下载尝试（不含重试）。
+func downloadFileOnce(ctx context.Context, url string, log func(string, ...any)) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, downloadTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := downloadHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		return "", &httpStatusError{code: resp.StatusCode}
+	}
+	if resp.ContentLength > downloadMaxBytes {
+		return "", fmt.Errorf("%w: Content-Length %d exceeds %d", errDownloadTooLarge, resp.ContentLength, downloadMaxBytes)
 	}
 
 	f, err := os.CreateTemp("", "ridgericetalk-download-*")
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	// 失败时删除临时文件；成功返回路径时把 cleanup 置空。
+	cleanup := func() {
+		f.Close()
+		os.Remove(f.Name())
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			cleanup()
+		}
+	}()
 
 	// Log rough progress for large downloads (every 10 MiB).
 	var total int64
@@ -306,10 +436,15 @@ func downloadFile(url string, log func(string, ...any)) (string, error) {
 	}
 	const logInterval = 10 * 1024 * 1024
 	var written int64
+	// LimitReader 多留 1 字节，用于判定「恰好超限」。
+	body := io.LimitReader(resp.Body, downloadMaxBytes+1)
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := resp.Body.Read(buf)
+		n, readErr := body.Read(buf)
 		if n > 0 {
+			if written+int64(n) > downloadMaxBytes {
+				return "", fmt.Errorf("%w: more than %d bytes", errDownloadTooLarge, downloadMaxBytes)
+			}
 			if _, werr := f.Write(buf[:n]); werr != nil {
 				return "", werr
 			}
@@ -318,13 +453,17 @@ func downloadFile(url string, log func(string, ...any)) (string, error) {
 				log("[thirdparty] downloaded %.1f/%.1f MiB", float64(written)/(1024*1024), float64(total)/(1024*1024))
 			}
 		}
-		if err == io.EOF {
+		if readErr == io.EOF {
 			break
 		}
-		if err != nil {
-			return "", err
+		if readErr != nil {
+			return "", readErr
 		}
 	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	ok = true
 	return f.Name(), nil
 }
 
@@ -355,6 +494,54 @@ func extractTarXz(src, dst string) error {
 	return fmt.Errorf("tar.xz extraction on Windows requires an external xz decompressor")
 }
 
+// 解压保护上限（1.9.5 task-138，规则 4 的同族风险：资源耗尽）。
+//
+// 内嵌依赖包来自第三方 CDN，理论上可信，但下载链路只校验「传输大小」不校验
+// 「解压后大小」——压缩炸弹可以在几百 KB 的包里塞进几十 GB。这里在解压前用
+// 条目数 + 声明的解压后总量预检，解压过程中再用累计写入量兜底（防止声明的
+// UncompressedSize 撒谎）。
+const (
+	extractMaxTotalBytes int64 = 512 << 20 // 512MiB
+	extractMaxEntries          = 10000
+)
+
+var (
+	errExtractTooLarge  = errors.New("archive exceeds extraction size limit")
+	errExtractTooMany   = errors.New("archive has too many entries")
+	errExtractTraversal = errors.New("archive entry escapes target directory")
+)
+
+// extractBudget 累计解压条目数与写入字节数，超限立即失败（不静默跳过）。
+type extractBudget struct {
+	entries int
+	bytes   int64
+}
+
+func (b *extractBudget) addEntry() error {
+	b.entries++
+	if b.entries > extractMaxEntries {
+		return fmt.Errorf("%w: more than %d entries", errExtractTooMany, extractMaxEntries)
+	}
+	return nil
+}
+
+func (b *extractBudget) addBytes(n int64) error {
+	b.bytes += n
+	if b.bytes > extractMaxTotalBytes {
+		return fmt.Errorf("%w: more than %d bytes", errExtractTooLarge, extractMaxTotalBytes)
+	}
+	return nil
+}
+
+// remaining 返回还能写入的字节数 +1，供 io.LimitReader 提前截断。
+func (b *extractBudget) remaining() int64 {
+	left := extractMaxTotalBytes - b.bytes
+	if left < 0 {
+		return 1
+	}
+	return left + 1
+}
+
 func extractTarGz(src, dst string) error {
 	f, err := os.Open(src)
 	if err != nil {
@@ -369,6 +556,7 @@ func extractTarGz(src, dst string) error {
 	defer gz.Close()
 
 	tr := tar.NewReader(gz)
+	budget := &extractBudget{}
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -377,10 +565,13 @@ func extractTarGz(src, dst string) error {
 		if err != nil {
 			return err
 		}
+		if err := budget.addEntry(); err != nil {
+			return err
+		}
 
 		target := filepath.Join(dst, header.Name)
 		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(dst)+string(os.PathSeparator)) {
-			continue // skip path traversal attempts
+			return fmt.Errorf("%w: %s", errExtractTraversal, header.Name)
 		}
 
 		switch header.Typeflag {
@@ -396,11 +587,14 @@ func extractTarGz(src, dst string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
+			n, copyErr := io.Copy(out, io.LimitReader(tr, budget.remaining()))
+			out.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if err := budget.addBytes(n); err != nil {
 				return err
 			}
-			out.Close()
 		}
 	}
 	return nil
@@ -413,10 +607,26 @@ func extractZip(src, dst string) error {
 	}
 	defer r.Close()
 
+	if len(r.File) > extractMaxEntries {
+		return fmt.Errorf("%w: %d entries", errExtractTooMany, len(r.File))
+	}
+	// 预检：先按声明的解压后大小估算总量，尽早拒绝压缩炸弹。
+	var declared uint64
 	for _, f := range r.File {
+		declared += f.UncompressedSize64
+		if declared > uint64(extractMaxTotalBytes) {
+			return fmt.Errorf("%w: declared %d bytes", errExtractTooLarge, declared)
+		}
+	}
+
+	budget := &extractBudget{}
+	for _, f := range r.File {
+		if err := budget.addEntry(); err != nil {
+			return err
+		}
 		target := filepath.Join(dst, f.Name)
 		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(dst)+string(os.PathSeparator)) {
-			continue
+			return fmt.Errorf("%w: %s", errExtractTraversal, f.Name)
 		}
 
 		if f.FileInfo().IsDir() {
@@ -440,10 +650,13 @@ func extractZip(src, dst string) error {
 			out.Close()
 			return err
 		}
-		_, err = io.Copy(out, rc)
+		n, copyErr := io.Copy(out, io.LimitReader(rc, budget.remaining()))
 		rc.Close()
 		out.Close()
-		if err != nil {
+		if copyErr != nil {
+			return copyErr
+		}
+		if err := budget.addBytes(n); err != nil {
 			return err
 		}
 	}

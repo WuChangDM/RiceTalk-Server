@@ -12,6 +12,7 @@ import (
 	"ridgericetalk/core/errors"
 	"ridgericetalk/internal/config"
 	"ridgericetalk/internal/message"
+	"ridgericetalk/internal/notifications"
 	"ridgericetalk/internal/realtime"
 	"ridgericetalk/internal/user"
 	"ridgericetalk/middleware"
@@ -158,6 +159,12 @@ func (h *Handler) CreateMessage(c *gin.Context) {
 		return
 	}
 
+	// 1.9.4 task-118：给会话另一方落库一条 dm 通知（不依赖对方是否在线/有无 WS 连接）。
+	// 通知写入是副作用，失败不影响消息本身。
+	if recipient, rerr := h.service.OtherParticipant(channelID, userID); rerr == nil && recipient != "" {
+		_ = notifications.NewService(h.db).NotifyDM(msg, recipient, authorName)
+	}
+
 	// Broadcast to channel subscribers via WebSocket
 	if h.hub != nil {
 		payload := map[string]interface{}{
@@ -182,4 +189,3 @@ func (h *Handler) CreateMessage(c *gin.Context) {
 	}
 	errors.Success(c, msg)
 }
-

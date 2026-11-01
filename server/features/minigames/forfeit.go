@@ -1,6 +1,7 @@
 package minigames
 
 import (
+	"log"
 	"time"
 
 	"ridgericetalk/internal/model"
@@ -88,7 +89,10 @@ func (h *Handler) forfeit1v1(session *model.MinigameSession, winnerID, loserID, 
 		return false
 	}
 	// 统一终局出口：写历史 + 权威计分（棋类胜场 +1）。
-	h.finishGame(session, winnerID, false)
+	if err := h.finishGame(session, winnerID, false); err != nil {
+		log.Printf("[minigames] 结算权威计分失败 session=%s game=%s winner=%s: %v",
+			session.ID, session.GameType, winnerID, err)
+	}
 	h.broadcastToRoom(session.ID, map[string]interface{}{
 		"gameId":    session.ID,
 		"eventType": "game_ended",

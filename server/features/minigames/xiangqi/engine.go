@@ -18,14 +18,25 @@
 //   - moveCount: 已走步数
 //
 // action 协议（与 chess 包同构）：
-//   - 仅支持 "move_made"，payload 为 {"from":{"x":..,"y":..},"to":{"x":..,"y":..}}
+//   - move_made: payload 为 {"from":{"x":..,"y":..},"to":{"x":..,"y":..}}
+//   - resign:    认输，对手获胜，endReason=resign
+//   - draw_offer / draw_accept / draw_reject：求和双确认（60s 无响应视为拒绝）
+//   - undo_request / undo_accept / undo_reject：悔棋双确认（每局最多 3 次成功），
+//     接受后回退最近一个半步并轮到发起方（不写历史，对局继续）
+//
+// 控制动作的共享记账在 features/minigames/internal/util/control.go；
+// 本包负责半步历史与棋子/被吃子还原。
 package xiangqi
 
 import (
 	"encoding/json"
+	"time"
 
 	"ridgericetalk/features/minigames/internal/util"
 )
+
+// moveHistoryKey 半步历史在 state 中的字段名（悔棋回退依赖它）。
+const moveHistoryKey = "moveHistory"
 
 // 棋盘尺寸：9 列 × 10 行。
 const (
@@ -117,11 +128,30 @@ func (e *Engine) Init(players []map[string]interface{}) (map[string]interface{},
 	return state, nil
 }
 
-// ValidateMove 校验并执行一步走子，返回更新后的权威 state。
+// ValidateMove 按 action 分发：走子走棋，控制类动作走 resign/draw/undo 分支。
 func (e *Engine) ValidateMove(state map[string]interface{}, userID string, action string, payload json.RawMessage) (map[string]interface{}, error) {
-	if action != "move_made" {
+	// 复制入参：控制动作会就地改 pending/undoCount 字段，不能污染调用方手里的旧 state。
+	state = util.ShallowCopy(state)
+	now := time.Now().Unix()
+	// 求和请求超时惰性清理：60s 无响应视为拒绝（不阻断对局，不引入后台定时器）。
+	util.ExpireOffer(state, util.PendingDrawKey, now)
+
+	switch action {
+	case "move_made":
+		return e.applyMove(state, userID, payload)
+	case "resign":
+		return e.applyResign(state, userID)
+	case "draw_offer", "draw_accept", "draw_reject":
+		return e.applyDraw(state, userID, action, now)
+	case "undo_request", "undo_accept", "undo_reject":
+		return e.applyUndo(state, userID, action, now)
+	default:
 		return nil, util.ErrInvalidAction
 	}
+}
+
+// applyMove 校验并执行一步走子，返回更新后的权威 state。
+func (e *Engine) applyMove(state map[string]interface{}, userID string, payload json.RawMessage) (map[string]interface{}, error) {
 	currentPlayer, _ := state["currentPlayer"].(string)
 	if currentPlayer != "" && currentPlayer != userID {
 		return nil, util.ErrNotYourTurn
@@ -218,7 +248,229 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 	} else {
 		newState["moveCount"] = 1
 	}
+	// 记录半步历史（悔棋回退用）：被吃子与「不吃半步计数」都按走子前快照保存，
+	// 悔棋时原样还原，避免把 60 回合和棋计数也算错。userId 用于判定
+	// 「悔棋发起人必须是上一手落子者」（撤回自己那一手）。
+	entry := map[string]interface{}{
+		"userId":          userID,
+		"from":            map[string]int{"x": p.From.X, "y": p.From.Y},
+		"to":              map[string]int{"x": p.To.X, "y": p.To.Y},
+		"noCaptureBefore": intFromState(state["noCaptureMoves"]),
+		"moveCountBefore": intFromState(state["moveCount"]),
+	}
+	if capPiece := board[p.To.Y][p.To.X]; capPiece != nil {
+		entry["captured"] = map[string]interface{}{"type": capPiece.Type, "color": capPiece.Color}
+	}
+	history := moveHistoryFromState(state)
+	newState[moveHistoryKey] = append(history, entry)
+	// 走子意味着局面推进，之前挂起的求和/悔棋请求自动作废。
+	delete(newState, util.PendingDrawKey)
+	delete(newState, util.PendingUndoKey)
 	return newState, nil
+}
+
+// applyResign 认输：对手获胜，交给 handler 统一结算（ended + 历史 + 广播）。
+func (e *Engine) applyResign(state map[string]interface{}, userID string) (map[string]interface{}, error) {
+	if w, _ := state["winner"].(string); w != "" {
+		return nil, util.ErrInvalidAction
+	}
+	players := util.GetStringSlice(state, "players")
+	if err := util.MarkResigned(state, players, userID); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+// applyDraw 求和：发起 → 对手接受/拒绝，接受即和棋结算。
+func (e *Engine) applyDraw(state map[string]interface{}, userID, action string, now int64) (map[string]interface{}, error) {
+	players := util.GetStringSlice(state, "players")
+	if !util.Contains(players, userID) {
+		return nil, util.ErrNotSeatedPlayer
+	}
+	if w, _ := state["winner"].(string); w != "" {
+		return nil, util.ErrInvalidAction
+	}
+	switch action {
+	case "draw_offer":
+		if _, ok := util.OfferFrom(state, util.PendingDrawKey); ok {
+			return nil, util.ErrOfferAlreadyOpen
+		}
+		util.SetOffer(state, util.PendingDrawKey, userID, now)
+		return state, nil
+	case "draw_accept":
+		from, ok := util.OfferFrom(state, util.PendingDrawKey)
+		if !ok {
+			return nil, util.ErrNoPendingOffer
+		}
+		if from == userID {
+			return nil, util.ErrOfferFromSelf
+		}
+		util.MarkDrawAgreed(state)
+		return state, nil
+	case "draw_reject":
+		from, ok := util.OfferFrom(state, util.PendingDrawKey)
+		if !ok {
+			return nil, util.ErrNoPendingOffer
+		}
+		if from == userID {
+			return nil, util.ErrOfferFromSelf
+		}
+		util.ClearOffer(state, util.PendingDrawKey)
+		return state, nil
+	}
+	return nil, util.ErrInvalidAction
+}
+
+// applyUndo 悔棋：发起 → 对手接受/拒绝；接受回退最近一个半步并轮到发起方。
+func (e *Engine) applyUndo(state map[string]interface{}, userID, action string, now int64) (map[string]interface{}, error) {
+	players := util.GetStringSlice(state, "players")
+	if !util.Contains(players, userID) {
+		return nil, util.ErrNotSeatedPlayer
+	}
+	if w, _ := state["winner"].(string); w != "" {
+		return nil, util.ErrInvalidAction
+	}
+	switch action {
+	case "undo_request":
+		// 悔棋只能由「上一手落子的人」发起：撤回的是自己那一手，由当前回合方
+		// （对手）确认；不能用 currentPlayer 判断（那时已经是等待确认的对手）。
+		history := moveHistoryFromState(state)
+		if len(history) == 0 {
+			return nil, util.ErrNoMoveToUndo
+		}
+		if util.LastMover(history) != userID {
+			return nil, util.ErrNotLastMover
+		}
+		if _, ok := util.OfferFrom(state, util.PendingUndoKey); ok {
+			return nil, util.ErrOfferAlreadyOpen
+		}
+		if util.UndoCount(state) >= util.MaxUndoPerGame {
+			return nil, util.ErrUndoLimitReached
+		}
+		util.SetOffer(state, util.PendingUndoKey, userID, now)
+		return state, nil
+	case "undo_reject":
+		from, ok := util.OfferFrom(state, util.PendingUndoKey)
+		if !ok {
+			return nil, util.ErrNoPendingOffer
+		}
+		if from == userID {
+			return nil, util.ErrOfferFromSelf
+		}
+		util.ClearOffer(state, util.PendingUndoKey)
+		return state, nil
+	case "undo_accept":
+		from, ok := util.OfferFrom(state, util.PendingUndoKey)
+		if !ok {
+			return nil, util.ErrNoPendingOffer
+		}
+		if from == userID {
+			return nil, util.ErrOfferFromSelf
+		}
+		if util.UndoCount(state) >= util.MaxUndoPerGame {
+			return nil, util.ErrUndoLimitReached
+		}
+		return e.revertLastHalfMove(state, from)
+	}
+	return nil, util.ErrInvalidAction
+}
+
+// revertLastHalfMove 回退最近一个半步：棋子退回起点、被吃子还原、
+// 不吃半步计数/走子数回滚，并把行棋权交还发起方（task-122 验收口径）。
+func (e *Engine) revertLastHalfMove(state map[string]interface{}, requester string) (map[string]interface{}, error) {
+	history := moveHistoryFromState(state)
+	if len(history) == 0 {
+		return nil, util.ErrNoMoveToUndo
+	}
+	last := history[len(history)-1]
+	from := pointFromAny(last["from"])
+	to := pointFromAny(last["to"])
+	if !inBoard(from.X, from.Y) || !inBoard(to.X, to.Y) {
+		return nil, util.ErrInvalidAction
+	}
+	board := boardFromState(state)
+	nb := cloneBoard(board)
+	mover := nb[to.Y][to.X]
+	if mover == nil {
+		return nil, util.ErrInvalidAction
+	}
+	nb[to.Y][to.X] = nil
+	nb[from.Y][from.X] = mover
+	if capRaw, ok := last["captured"]; ok && capRaw != nil {
+		if cp := pieceFromAny(capRaw); cp != nil {
+			nb[to.Y][to.X] = cp
+		}
+	}
+
+	players := util.GetStringSlice(state, "players")
+	newState := util.ShallowCopy(state)
+	newState["board"] = nb
+	newState[moveHistoryKey] = history[:len(history)-1]
+	newState["currentPlayer"] = requester
+	newState["winner"] = nil
+	newState["draw"] = false
+	newState["endReason"] = ""
+	newState["noCaptureMoves"] = int(util.Int64FromState(last["noCaptureBefore"]))
+	newState["moveCount"] = int(util.Int64FromState(last["moveCountBefore"]))
+	newState["check"] = isKingInCheck(nb, colorOfPlayer(players, requester))
+	if len(history) > 1 {
+		prev := history[len(history)-2]
+		pf, pt := pointFromAny(prev["from"]), pointFromAny(prev["to"])
+		newState["lastMove"] = map[string]interface{}{
+			"from": map[string]int{"x": pf.X, "y": pf.Y},
+			"to":   map[string]int{"x": pt.X, "y": pt.Y},
+		}
+	} else {
+		newState["lastMove"] = nil
+	}
+	util.BumpUndoCount(newState)
+	delete(newState, util.PendingUndoKey)
+	delete(newState, util.PendingDrawKey)
+	return newState, nil
+}
+
+// moveHistoryFromState 归一化 state 里的半步历史（JSON 反序列化后是 []interface{}）。
+func moveHistoryFromState(state map[string]interface{}) []map[string]interface{} {
+	raw, ok := state[moveHistoryKey]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch h := raw.(type) {
+	case []map[string]interface{}:
+		return h
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(h))
+		for _, item := range h {
+			if m, ok := item.(map[string]interface{}); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// pointFromAny 把历史里的坐标（map 或 pt）归一化为 pt。
+func pointFromAny(v interface{}) pt {
+	switch m := v.(type) {
+	case map[string]int:
+		return pt{X: m["x"], Y: m["y"]}
+	case map[string]interface{}:
+		return pt{X: int(util.Int64FromState(m["x"])), Y: int(util.Int64FromState(m["y"]))}
+	case pt:
+		return m
+	}
+	return pt{}
+}
+
+// cloneBoard 复制棋盘行（悔棋回退需要可变副本，避免改到入参 state 的棋盘）。
+func cloneBoard(b [][]*piece) [][]*piece {
+	nb := make([][]*piece, len(b))
+	for i := range b {
+		nb[i] = make([]*piece, len(b[i]))
+		copy(nb[i], b[i])
+	}
+	return nb
 }
 
 // IsGameOver 报告对局是否已结束。

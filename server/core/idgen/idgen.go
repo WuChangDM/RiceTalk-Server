@@ -109,27 +109,28 @@ func String(id int64) string {
 
 // Business prefix constants for common entity types.
 const (
-	PrefixUser    = "user"
-	PrefixChannel = "ch"
-	PrefixMessage = "msg"
-	PrefixSpace   = "space"
-	PrefixSession    = "sess"
-	PrefixBot        = "bot"
-	PrefixFile       = "file"
-	PrefixDoc        = "doc"
-	PrefixComment    = "cmt"
-	PrefixStroke     = "stroke"
-	PrefixWhiteboard = "wb"
-	PrefixEvent      = "event"
-	PrefixGame       = "game"
-	PrefixNet        = "net"
-	PrefixReset      = "reset"
-	PrefixDM         = "dm"
-	PrefixRemoteAssist = "ra" // T49: 远程协助会话
-	PrefixShare        = "share" // DES-2026-0912-05: 云文件分享链接
+	PrefixUser         = "user"
+	PrefixChannel      = "ch"
+	PrefixMessage      = "msg"
+	PrefixSpace        = "space"
+	PrefixSession      = "sess"
+	PrefixBot          = "bot"
+	PrefixFile         = "file"
+	PrefixDoc          = "doc"
+	PrefixComment      = "cmt"
+	PrefixStroke       = "stroke"
+	PrefixWhiteboard   = "wb"
+	PrefixEvent        = "event"
+	PrefixGame         = "game"
+	PrefixNet          = "net"
+	PrefixReset        = "reset"
+	PrefixDM           = "dm"
+	PrefixRemoteAssist = "ra"     // T49: 远程协助会话
+	PrefixShare        = "share"  // DES-2026-0912-05: 云文件分享链接
 	PrefixInvite       = "invite" // A8-S1: 日程事件邀请 RSVP
-	PrefixAlert        = "alert" // DES-20261001-01 §12: 管理后台监控告警
-	PrefixEmoji        = "emoji" // DES-20261002-01 §4.7: B7 自定义服务器表情
+	PrefixAlert        = "alert"  // DES-20261001-01 §12: 管理后台监控告警
+	PrefixEmoji        = "emoji"  // DES-20261002-01 §4.7: B7 自定义服务器表情
+	PrefixNotification = "ntf"    // 1.9.4 task-118: 通知中心记录
 )
 
 // GenerateID generates a prefixed ID like "user_723169646487932928".

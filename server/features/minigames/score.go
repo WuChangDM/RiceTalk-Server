@@ -2,6 +2,10 @@ package minigames
 
 import (
 	"fmt"
+	"hash/fnv"
+	"sync"
+
+	"gorm.io/gorm"
 
 	"ridgericetalk/core/errors"
 	"ridgericetalk/core/idgen"
@@ -49,36 +53,67 @@ func isAuthoritativeScored(gameType string) bool {
 
 // finishGame 是「一局结束」的统一出口：写历史 +（权威计分游戏）给胜者累加胜场。
 // 所有终局路径（引擎判定、超时托管、1v1 判负）都必须走这里，避免漏记或口径不一。
-func (h *Handler) finishGame(session *model.MinigameSession, winnerID string, isDraw bool) {
+//
+// 返回值只反映**权威计分写入**是否成功：历史记录写入失败仍按「不阻断终局」处理
+// （见 RecordGameEnd 注释），计分失败由调用方记录 ERROR 日志——此时对局已经落库为
+// ended，把 HTTP 请求改成 500 会让客户端重试并重复写历史，因此调用方只记日志。
+func (h *Handler) finishGame(session *model.MinigameSession, winnerID string, isDraw bool) error {
 	h.RecordGameEnd(session, winnerID, isDraw)
 	if isDraw || winnerID == "" {
-		return
+		return nil
 	}
 	if !isAuthoritativeScored(session.GameType) {
-		return
+		return nil
 	}
-	h.addAuthoritativeWin(session.GameType, winnerID)
+	return h.addAuthoritativeWin(session.GameType, winnerID)
 }
 
 // addAuthoritativeWin 给胜者累加 1 场胜利。
 // 幂等性由「每局只经过一次 finishGame」保证（会话结束即不再进入 action/超时路径）。
-func (h *Handler) addAuthoritativeWin(gameType, userID string) {
+//
+// 1.9.5 task-138（规则 3）：原实现是「First 查行 → 内存 +1 → Save」，并发结算会互相
+// 覆盖（丢胜场），且 Save/Create 的错误被 `_ =` 吞掉。现改为单条原子自增：
+//   - 有行：`UPDATE ... SET best_score = best_score + 1 WHERE ...`（原子，不读改写）；
+//   - 无行：插入初始行；插入失败（并发下已被另一结算插入 / PG 唯一约束冲突）→ 回退
+//     一次原子自增，避免重复行。
+func (h *Handler) addAuthoritativeWin(gameType, userID string) error {
 	if userID == "" {
-		return
+		return nil
 	}
-	var row model.MinigameLeaderboard
-	err := h.db.Where("game_type = ? AND user_id = ?", gameType, userID).First(&row).Error
-	if err == nil {
-		row.BestScore++
-		_ = h.db.Save(&row).Error
-		return
+	lock := leaderboardKeyLock(gameType, userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	res := h.db.Model(&model.MinigameLeaderboard{}).
+		Where("game_type = ? AND user_id = ?", gameType, userID).
+		Update("best_score", gorm.Expr("best_score + 1"))
+	if res.Error != nil {
+		return fmt.Errorf("increment authoritative win: %w", res.Error)
 	}
-	_ = h.db.Create(&model.MinigameLeaderboard{
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	// 无既有行 → 插入首胜。
+	createErr := h.db.Create(&model.MinigameLeaderboard{
 		ID:        idgen.NextString(),
 		GameType:  gameType,
 		UserID:    userID,
 		BestScore: 1,
 	}).Error
+	if createErr == nil {
+		return nil
+	}
+	// 插入失败：可能是并发结算已插入同一行（PG 唯一约束），回退为原子自增。
+	retry := h.db.Model(&model.MinigameLeaderboard{}).
+		Where("game_type = ? AND user_id = ?", gameType, userID).
+		Update("best_score", gorm.Expr("best_score + 1"))
+	if retry.Error != nil {
+		return fmt.Errorf("create authoritative win: %v; retry increment: %w", createErr, retry.Error)
+	}
+	if retry.RowsAffected == 0 {
+		return fmt.Errorf("create authoritative win: %w", createErr)
+	}
+	return nil
 }
 
 // validateSinglePlayerScore 校验单机排行榜上报的分数（D1「限上限 + 异常分检测」）。
@@ -97,4 +132,18 @@ func validateSinglePlayerScore(info GameInfo, score, currentBest int64) error {
 			fmt.Sprintf("score jump looks anomalous (previous=%d, submitted=%d)", currentBest, score))
 	}
 	return nil
+}
+
+// leaderboardKeyLocks 按 (gameType, userID) 分片串行化「无行 → 插入首条」这段临界区。
+//
+// 为什么需要：PG 侧 000024 建表时有 UNIQUE(game_type, user_id)，但 SQLite 的 AutoMigrate
+// 不会建这个约束（模型上没有对应 uniqueIndex 标签），开发库/单测里两个并发请求可能各自
+// 插入一行，形成重复行。进程内按 key 加锁即可消除该窗口；跨进程（多实例）仍由 PG 唯一
+// 约束 + 插入失败回退原子更新兜底。
+var leaderboardKeyLocks [64]sync.Mutex
+
+func leaderboardKeyLock(gameType, userID string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(gameType + "|" + userID))
+	return &leaderboardKeyLocks[h.Sum32()%uint32(len(leaderboardKeyLocks))]
 }

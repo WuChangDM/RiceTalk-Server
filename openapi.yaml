@@ -264,6 +264,14 @@ paths:
                   maxLength: 64
                   description: 可选。设备名（S-2），覆盖旧会话行携带的值
                   example: DEV-PC
+                deviceId:
+                  type: string
+                  maxLength: 64
+                  description: |-
+                    可选。安装级设备标识（task-131）。上报后轮换出的新会话行继续
+                    携带同一 device_id；不传则继承旧会话行的值，因此 refresh 不会
+                    让「登录设备」多出一行。
+                  example: 0f8fad5b-d9cb-469f-a165-70867728950e
       responses:
         '200':
           description: 刷新成功
@@ -4566,22 +4574,28 @@ paths:
   /api/v1/notifications:
     get:
       tags: [Users]
-      summary: 获取用户通知列表
-      description: 获取用户的 @提及、系统通知、回复等通知列表。支持分页。
+      summary: 获取通知列表（1.9.4 task-118 真实落库）
+      description: |
+        返回当前登录用户的通知（@提及 / 私信），按 created_at 倒序。
+        分页使用游标：把上一页返回的 nextCursor 原样传回 cursor；nextCursor 为空表示没有更多。
+        响应统一包在 code/message/data 信封里。
+        unreadCount 是该用户全部未读数，不受 unreadOnly / limit / cursor 影响。
       security:
       - BearerAuth: []
       - CookieAuth: []
       parameters:
-      - name: limit
-        in: query
-        schema: {type: integer, default: 20}
-      - name: before
-        in: query
-        schema: {type: string}
-        description: 游标分页，上一页最后一条的ID
-      - name: unread_only
+      - name: unreadOnly
         in: query
         schema: {type: boolean, default: false}
+        description: 只返回未读通知（1/true/yes/on）
+      - name: limit
+        in: query
+        schema: {type: integer, default: 20, maximum: 100}
+        description: 单页条数，超过 100 按 100 处理
+      - name: cursor
+        in: query
+        schema: {type: string}
+        description: 游标 = 上一页最后一条通知的 id；非法游标返回 400
       responses:
         '200':
           description: 通知列表
@@ -4590,38 +4604,66 @@ paths:
               schema:
                 type: object
                 properties:
-                  notifications:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id: {type: string}
-                        type:
-                          type: string
-                          enum: [mention, reply, system, bot, recording]
-                          description: mention=@提及 reply=回复 system=系统通知 bot=机器人 recording=录制
-                        title: {type: string, description: 通知标题}
-                        body: {type: string, description: 通知内容}
-                        read: {type: boolean}
-                        data:
+                  code: {type: string, example: OK}
+                  message: {type: string, example: success}
+                  data:
+                    type: object
+                    properties:
+                      notifications:
+                        type: array
+                        items:
                           type: object
-                          description: 关联数据(消息ID/频道ID/跳转链接)
-                        created_at: {type: string, format: date-time}
+                          properties:
+                            id: {type: string}
+                            type:
+                              type: string
+                              enum: [mention, dm, invite, system]
+                              description: mention=@提及 dm=私信 invite=邀请 system=系统
+                            title: {type: string}
+                            body: {type: string, description: 消息摘要（最多 80 字符）}
+                            refType:
+                              type: string
+                              enum: [message, dm_channel]
+                              description: 跳转目标类型
+                            refId: {type: string, description: refType 对应的 ID}
+                            spaceId: {type: string, description: 所属 Space（私信通知没有）}
+                            readAt: {type: string, format: date-time, nullable: true}
+                            createdAt: {type: string, format: date-time}
+                      unreadCount: {type: integer, description: 全部未读数}
+                      nextCursor: {type: string, description: 下一页游标，空表示没有更多}
+        '400':
+          description: 游标非法（SYSTEM_BAD_REQUEST）
+        '401':
+          description: 未登录
   /api/v1/notifications/read-all:
     post:
       tags: [Users]
-      summary: 标记所有通知为已读
+      summary: 标记全部通知为已读
+      description: 只影响当前登录用户的未读通知；幂等（重复调用 updated=0）。
       security:
       - BearerAuth: []
       - CookieAuth: []
       responses:
         '200':
           description: 操作成功
-
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: {type: string, example: OK}
+                  data:
+                    type: object
+                    properties:
+                      message: {type: string, example: ok}
+                      updated: {type: integer, description: 本次标记的条数}
+        '401':
+          description: 未登录
   /api/v1/notifications/{id}/read:
     post:
       tags: [Users]
       summary: 标记单条通知为已读
+      description: 幂等；已读时间不会被重复调用覆盖。通知不存在返回 404，属于他人返回 403。
       security:
       - BearerAuth: []
       - CookieAuth: []
@@ -4633,6 +4675,24 @@ paths:
       responses:
         '200':
           description: 操作成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code: {type: string, example: OK}
+                  data:
+                    type: object
+                    properties:
+                      message: {type: string, example: ok}
+                      id: {type: string}
+                      readAt: {type: string, format: date-time}
+        '401':
+          description: 未登录
+        '403':
+          description: 该通知不属于当前用户（PERMISSION 语义，不泄露存在性）
+        '404':
+          description: 通知不存在（NOTIFICATION_NOT_FOUND）
 
   # ═══════════════════════════════════════════════════════════
   # @提及 (Mentions)
@@ -4797,6 +4857,10 @@ paths:
         `game_start`（房主，从 waiting 开局）、`game_restart`（房主，「再来一局」，重置 state，设计 §15.3.4）、
         `move_made`/`roll_dice`/`move_pawn`/`bid`/`play`/`werewolf_kill`/`seer_check`/`vote`/`next_phase`（各引擎自行声明）。
         日本麻将（`riichi`）：`discard`/`riichi`/`chi`/`pon`/`minkan`/`ankan`/`kakan`/`tsumo`/`ron`/`pass`/`kyushukyuhai`（payload：`{"tiles":["1m"],"called":"5p"}`，规则内核经 `features/minigames/riichi/core` 适配）。
+        联机棋类（`xiangqi`/`gobang`，1.9.4）对局控制，payload 传 `{}`：
+        `resign` 认输（对手获胜并写结算历史；已结束房间重复提交幂等返回 200，不重复结算）；
+        `draw_offer`/`draw_accept`/`draw_reject` 求和双确认（接受即和棋并写历史，发起后 60 秒无响应视为拒绝）；
+        `undo_request`/`undo_accept`/`undo_reject` 悔棋双确认：**由上一手落子方发起**（撤回的是自己最近一手，不能抹掉对手的落子），由当前回合方（对手）确认；接受后盘面回退该手、轮次回到发起方重走、不写结算历史，每局最多成功 3 次。
       security: [BearerAuth: [], CookieAuth: []]
       requestBody:
         required: true
@@ -4804,8 +4868,8 @@ paths:
           application/json:
             schema: {type: object, required: [sessionId, action], properties: {sessionId: {type: string}, action: {type: string}, payload: {type: object}}}
       responses:
-        '200': {description: 动作已记录}
-        '400': {description: 请求参数错误 / 非法动作 / 非房主 / 人数不足}
+        '200': {description: 动作已记录（已结束房间重复 resign 返回 data.idempotent=true）}
+        '400': {description: 请求参数错误 / 非法动作 / 非房主 / 人数不足 / 对局已结束（非 resign 的控制动作）/ 无待处理请求 / 悔棋次数已用完；悔棋专项错误码：`MINIGAME_NO_MOVE_TO_UNDO`（没有可悔的棋步）、`MINIGAME_NOTHING_TO_UNDO`（发起人不是上一手落子方）}
         '403': {description: 非该 Space 成员}
 
   /api/v1/minigames/leaderboard:
@@ -4857,7 +4921,13 @@ paths:
         required: true
         schema: {type: string}
       responses:
-        '200': {description: 会话状态}
+        '200':
+          description: |
+            会话状态。按调用者身份分流视角（服务端脱敏，客户端无需二次过滤）：
+            - 玩家视角 = 本座位 `views[seat]` + 公共信息；非本局玩家/观战者一律走 Spectator 视图；
+            - 斗地主：玩家视角 `hands` 仅本人、`handCounts` 给他人张数；观战/非玩家无 `hands`；
+            - 狼人杀：玩家视角 `roles` 仅本人（狼人另含同阵营狼）、`nightActions` 仅本人可见子集；观战/非玩家无 `roles`/`nightActions`；
+            - 日麻（M14/M-1）：玩家分支剥 `snapshot`，其余座位 `closed_tiles`/`drawn`/`legal_actions` 抹除。
         '404': {description: 会话不存在}
 
   /api/v1/minigames/chat:
@@ -5134,7 +5204,13 @@ paths:
   /api/v1/sharedoc/{id}/editors:
     get:
       tags: [SharedDoc]
-      summary: 获取当前正在协同编辑该文档的在线用户列表
+      summary: 获取文档的协作者清单（1.9.4 起语义为协作者，不再只是在线编辑者）
+      description: |
+        owner 恒在首位（role=owner）；随后是按授权时间升序的协作者。
+        元素结构 {userId, username, role, online, joinedAt}：role 取
+        owner|editor|viewer，online 表示此刻是否有实时编辑会话，
+        joinedAt 为授权时间（owner 为文档创建时间）。字段只增不删。
+        需要文档可见权限（空间成员或 owner）。
       security: [BearerAuth: [], CookieAuth: []]
       parameters:
       - name: id
@@ -5142,7 +5218,57 @@ paths:
         required: true
         schema: {type: string}
       responses:
-        '200': {description: 编辑者列表}
+        '200': {description: "协作者列表 {docId, editors, count}"}
+        '403': {description: 无访问权限（非空间成员且非 owner）}
+        '404': {description: 文档不存在}
+    post:
+      tags: [SharedDoc]
+      summary: 邀请协作者（仅 owner）
+      description: |
+        目标必须是「同空间成员」且「用户存在」；重复邀请幂等，仅覆盖 role。
+        role 缺省为 editor。owner 自己不能被加为协作者（400）。
+      security: [BearerAuth: [], CookieAuth: []]
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: {type: string}
+                role: {type: string, enum: [editor, viewer], default: editor}
+      responses:
+        '200': {description: "已授权 {docId, userId, role}"}
+        '400': {description: body 非法 / role 非法 / 目标是 owner / 目标非本空间成员}
+        '403': {description: 调用者不是文档 owner}
+        '404': {description: 文档不存在，或目标用户不存在（USER_NOT_FOUND）}
+
+  /api/v1/sharedoc/{id}/editors/{userId}:
+    delete:
+      tags: [SharedDoc]
+      summary: 撤销协作者授权（仅 owner）
+      description: 不能移除 owner 自己；对被移除者立即生效（下一次 PATCH 即 403）。
+      security: [BearerAuth: [], CookieAuth: []]
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+      - name: userId
+        in: path
+        required: true
+        schema: {type: string}
+      responses:
+        '200': {description: "已撤销 {docId, userId, message}"}
+        '400': {description: 试图移除 owner}
+        '403': {description: 调用者不是文档 owner}
+        '404': {description: 文档不存在，或该用户不是协作者}
 
   # ── 虚拟网络模块 (virtualnet) ──
   /api/v1/virtualnet/status:
@@ -6645,6 +6771,14 @@ components:
           maxLength: 64
           description: 可选。登录设备名（如主机名），用于「登录设备」列表展示；按字符截断，缺省空串
           example: DEV-PC
+        deviceId:
+          type: string
+          maxLength: 64
+          description: |-
+            可选。安装级稳定设备标识（task-131，客户端持久化的 UUIDv4）。非空时
+            同一 (user, device) 只保留一条会话：重复登录原地更新该行、「登录设备」
+            不再多出一台。缺省空串 = 老客户端，行为与 1.9.4 之前一致（每次登录新行）。
+          example: 0f8fad5b-d9cb-469f-a165-70867728950e
     AuthSession:
       type: object
       description: 一条活跃登录会话（S-2 多设备标识）
@@ -6667,6 +6801,12 @@ components:
           type: string
           description: 设备名（缺省空串）
           example: DEV-PC
+        deviceId:
+          type: string
+          description: |-
+            安装级设备标识（task-131）。空串表示该会话来自未上报标识的老客户端；
+            同一 deviceId 在同一用户下只应出现一次。
+          example: 0f8fad5b-d9cb-469f-a165-70867728950e
         ip:
           type: string
           description: |-

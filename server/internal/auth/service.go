@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -311,6 +313,9 @@ type LoginRequest struct {
 	// 用于「登录设备」列表展示；缺省为空串，服务端截断防滥用。
 	DeviceType string `json:"deviceType,omitempty"`
 	DeviceName string `json:"deviceName,omitempty"`
+	// DeviceID 安装级稳定设备标识（task-131，可选）：同一 (user, device) 重复登录
+	// 会原地更新会话行而非新增；缺省为空串时保持 1.9.4 之前的旧行为。
+	DeviceID string `json:"deviceId,omitempty"`
 	// A4-S1：会话来源网络信息。json:"-"——服务端 handler 从连接上下文填充
 	//（ClientIP / User-Agent 请求头），绝不允许客户端 JSON 自报伪造。
 	IP        string `json:"-"`
@@ -322,8 +327,12 @@ type LoginRequest struct {
 // A4-S1：IP/UserAgent 是服务端采集的会话网络上下文，随设备标识一并传递
 // 给 generateTokenPair 落库；空串表示未采集（如内部路径创建的会话）。
 type SessionDevice struct {
-	Type      string
-	Name      string
+	Type string
+	Name string
+	// DeviceID 是客户端安装级稳定设备标识（task-131）。非空时同一 (user, device)
+	// 只保留一行会话：登录原地更新、refresh 轮换后清理同设备其它行。
+	// 空串表示老客户端未上报，行为与 1.9.4 之前逐字一致（每次登录新增行）。
+	DeviceID  string
 	IP        string
 	UserAgent string
 }
@@ -332,6 +341,8 @@ type SessionDevice struct {
 const (
 	maxDeviceTypeLen = 32
 	maxDeviceNameLen = 64
+	// maxDeviceIDLen 是客户端安装级设备标识的列宽（task-131，与 model.UserSession 对齐）。
+	maxDeviceIDLen = 64
 	// A4-S1：user_agent 列宽 256；ip 列宽 45（IPv6 文本上限，见迁移 000038）。
 	maxUserAgentLen = 256
 	maxClientIPlen  = 45
@@ -385,6 +396,47 @@ func sanitizeSessionDevice(deviceType, deviceName string) SessionDevice {
 		Type: trimRunes(deviceType, maxDeviceTypeLen),
 		Name: trimRunes(deviceName, maxDeviceNameLen),
 	}
+}
+
+// sanitizeDeviceID 规整客户端上报的安装级设备标识（task-131）：trim 后按 rune
+// 截断到 64（与列宽一致）。不做格式校验——客户端约定为 UUIDv4，但服务端只把
+// 它当作不透明去重键；空串表示老客户端未上报，走旧行为。
+func sanitizeDeviceID(deviceID string) string {
+	deviceID = strings.TrimSpace(deviceID)
+	runes := []rune(deviceID)
+	if len(runes) > maxDeviceIDLen {
+		return string(runes[:maxDeviceIDLen])
+	}
+	return deviceID
+}
+
+// deviceSessionLocks 把「同一 (user, device) 的会话 upsert」在进程内串行化：
+// SQLite 开发/测试库无法建部分唯一索引，靠这把分片锁保证并发登录只产生一行；
+// PG 生产库另有 idx_user_sessions_user_device 部分唯一索引兜底（迁移 000048）。
+var deviceSessionLocks [64]sync.Mutex
+
+// lockDeviceSession 返回释放函数；deviceID 为空（老客户端）时不加锁。
+func lockDeviceSession(userID, deviceID string) func() {
+	if deviceID == "" {
+		return func() {}
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(userID))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(deviceID))
+	mu := &deviceSessionLocks[int(h.Sum32())%len(deviceSessionLocks)]
+	mu.Lock()
+	return mu.Unlock
+}
+
+// isUniqueViolation 判断数据库错误是否为唯一约束冲突（SQLite / PostgreSQL 两种文案）。
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint") ||
+		strings.Contains(msg, "duplicate key value violates unique constraint")
 }
 
 // SpaceInfo contains the user's current space info for login/register responses.
@@ -620,6 +672,9 @@ func (s *Service) Login(req *LoginRequest) (*TokenResponse, error) {
 	// security_alert。查询失败不阻断登录（宁漏发不误伤登录主流程）。
 	device := sessionMetaFromRequest(
 		sanitizeSessionDevice(req.DeviceType, req.DeviceName), req.IP, req.UserAgent)
+	// task-131：安装级设备标识随登录一并落库；非空时同一设备重复登录会原地
+	// 更新既有会话行（见 generateTokenPair），不再每次登录新增一行。
+	device.DeviceID = sanitizeDeviceID(req.DeviceID)
 	var existing []sessionRow
 	if err := s.db.Model(&model.UserSession{}).
 		Where("user_id = ? AND expires_at > ?", user.ID, now).
@@ -736,11 +791,20 @@ func (s *Service) RefreshToken(refreshToken string, device *SessionDevice) (*Tok
 	// A4-S1：网络上下文（IP/UA）不做继承——每次 refresh 都用当前请求的
 	// 采集值覆盖（「最近活跃 IP」语义；移动网络抖动可接受）。device 为 nil
 	// 时（内部路径）保持空串。
-	rotatedDevice := SessionDevice{Type: session.DeviceType, Name: session.DeviceName}
+	rotatedDevice := SessionDevice{
+		Type:     session.DeviceType,
+		Name:     session.DeviceName,
+		DeviceID: session.DeviceID,
+	}
 	if device != nil {
 		if device.Type != "" || device.Name != "" {
 			rotatedDevice.Type = device.Type
 			rotatedDevice.Name = device.Name
+		}
+		// task-131：客户端本次上报了设备标识则覆盖，否则继承旧行——refresh 轮换
+		// 出的新会话行继续携带同一 device_id，不会让「登录设备」多出一行。
+		if device.DeviceID != "" {
+			rotatedDevice.DeviceID = device.DeviceID
 		}
 		rotatedDevice.IP = device.IP
 		rotatedDevice.UserAgent = device.UserAgent
@@ -925,7 +989,27 @@ func (s *Service) generateTokenPair(user *model.User, device SessionDevice, tx .
 	if spaceInfo != nil {
 		spaceID = spaceInfo.ID
 	}
+
+	// task-131：同一安装级设备（device.DeviceID 非空）复用既有会话行 ID，使
+	// 「登录设备」列表保持一行、且 access token 的 session_id 始终指向该行
+	// （否则 isCurrent / 踢除当前会话的判断会失配）。空 deviceID（老客户端）
+	// 保持旧行为：每次登录新增一行。
+	unlock := lockDeviceSession(user.ID, device.DeviceID)
+	defer unlock()
+
+	existingSessionID := ""
+	if device.DeviceID != "" {
+		var existing model.UserSession
+		if err := db.Select("id").
+			Where("user_id = ? AND device_id = ?", user.ID, device.DeviceID).
+			Limit(1).Find(&existing).Error; err == nil && existing.ID != "" {
+			existingSessionID = existing.ID
+		}
+	}
 	sessionID := idgen.GenerateID(idgen.PrefixSession)
+	if existingSessionID != "" {
+		sessionID = existingSessionID
+	}
 
 	accessToken, refreshToken, err := middleware.GenerateTokenPair(
 		user.ID, user.Username, user.Email, user.Role, user.TokenVersion, spaceID, sessionID, s.cfg,
@@ -950,13 +1034,57 @@ func (s *Service) generateTokenPair(user *model.User, device SessionDevice, tx .
 		IsAdminSession: isAdmin,
 		DeviceType:     device.Type,
 		DeviceName:     device.Name,
+		DeviceID:       device.DeviceID,
 		IP:             device.IP,
 		UserAgent:      device.UserAgent,
 		LastActiveAt:   now,
 	}
 
-	if err := db.Create(session).Error; err != nil {
-		return nil, errors.ErrInternal.WithDetails("failed to create session")
+	// task-131：device_id 非空时按 (user_id, device_id) upsert——原地更新既有行
+	// 的 token/设备/网络上下文，保留 id 与 created_at；无既有行才插入。
+	deviceUpdates := map[string]interface{}{
+		"token_hash":       session.TokenHash,
+		"expires_at":       session.ExpiresAt,
+		"is_admin_session": session.IsAdminSession,
+		"device_type":      session.DeviceType,
+		"device_name":      session.DeviceName,
+		"device_id":        session.DeviceID,
+		"ip":               session.IP,
+		"user_agent":       session.UserAgent,
+		"last_active_at":   session.LastActiveAt,
+	}
+	if existingSessionID != "" {
+		res := db.Model(&model.UserSession{}).
+			Where("id = ? AND user_id = ?", existingSessionID, user.ID).
+			Updates(deviceUpdates)
+		if res.Error != nil {
+			return nil, errors.ErrInternal.WithDetails("failed to update session")
+		}
+		if res.RowsAffected == 0 {
+			// 既有行在并发窗口内被删除（踢除/过期清理）→ 回退为新插入。
+			if err := db.Create(session).Error; err != nil {
+				return nil, errors.ErrInternal.WithDetails("failed to create session")
+			}
+		}
+	} else if err := db.Create(session).Error; err != nil {
+		// 并发插入撞 (user_id, device_id) 部分唯一索引（PG 生产库）→ 回退为原地更新。
+		if device.DeviceID == "" || !isUniqueViolation(err) {
+			return nil, errors.ErrInternal.WithDetails("failed to create session")
+		}
+		if uerr := db.Model(&model.UserSession{}).
+			Where("user_id = ? AND device_id = ?", user.ID, device.DeviceID).
+			Updates(deviceUpdates).Error; uerr != nil {
+			return nil, errors.ErrInternal.WithDetails("failed to create session")
+		}
+	}
+
+	// task-131：同一 (user, device) 只保留一行。清理历史遗留/并发产生的其它行，
+	// 被删行的 refresh token 随之失效——同设备只保留最新一次登录，属预期行为。
+	if device.DeviceID != "" {
+		if err := db.Where("user_id = ? AND device_id = ? AND id <> ?",
+			user.ID, device.DeviceID, sessionID).Delete(&model.UserSession{}).Error; err != nil {
+			return nil, errors.ErrInternal.WithDetails("failed to prune device sessions")
+		}
 	}
 
 	return &TokenResponse{
@@ -1333,9 +1461,11 @@ func (s *Service) savePasswordHistoryTx(tx *gorm.DB, userID, hash string) error 
 // A4-S1：IP 是会话的最近活跃来源地址——ListSessions 只会话归属者本人可见，
 // 原样返回、由客户端脱敏展示（desensitizeIp）；空串表示未知（迁移前的老行）。
 type SessionInfo struct {
-	ID           string    `json:"id"`
-	DeviceType   string    `json:"deviceType"`
-	DeviceName   string    `json:"deviceName"`
+	ID         string `json:"id"`
+	DeviceType string `json:"deviceType"`
+	DeviceName string `json:"deviceName"`
+	// DeviceID 安装级设备标识（task-131）：空串表示该会话来自未上报标识的老客户端。
+	DeviceID     string    `json:"deviceId"`
 	IP           string    `json:"ip"`
 	LastActiveAt time.Time `json:"lastActiveAt"`
 	CreatedAt    time.Time `json:"createdAt"`
@@ -1366,6 +1496,7 @@ func (s *Service) ListSessions(userID, currentSessionID string) ([]SessionInfo, 
 			ID:           sess.ID,
 			DeviceType:   sess.DeviceType,
 			DeviceName:   sess.DeviceName,
+			DeviceID:     sess.DeviceID,
 			IP:           sess.IP,
 			LastActiveAt: lastActive,
 			CreatedAt:    sess.CreatedAt,

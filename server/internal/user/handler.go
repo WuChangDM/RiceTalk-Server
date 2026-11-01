@@ -409,12 +409,47 @@ func (h *Handler) Heartbeat(c *gin.Context) {
 	errors.Success(c, gin.H{"message": "heartbeat ok"})
 }
 
-// GetMembers returns all space members with their presence.
-// It bypasses the paginated GetUsers so the full member list is available to
-// the client for real-time presence rendering.
+// 空间成员列表的分页保护常量（1.9.5 task-138）。
+const (
+	defaultMembersLimit = 200
+	maxMembersLimit     = 1000
+)
+
+// parseMembersLimit 解析 limit 查询参数：缺省 200，非数字/非正数回默认，超上限截断。
+func parseMembersLimit(raw string) int {
+	limit := defaultMembersLimit
+	if raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	if limit > maxMembersLimit {
+		limit = maxMembersLimit
+	}
+	return limit
+}
+
+// GetMembers returns the members of the current space with their presence.
+//
+// 1.9.5 task-138（规则 2 / 越权）：原实现 `h.db.Find(&users)` 返回**全库用户**，
+// 任何登录用户都能拿到其它空间的用户名/头像/在线状态（跨空间越权），且没有 LIMIT
+// （用户量大时一次性拉全表）。现改为按当前 space_id JOIN memberships 过滤，
+// 并加 limit（默认 200、上限 1000）；响应结构保持不变（仍为成员数组）。
 func (h *Handler) GetMembers(c *gin.Context) {
+	spaceID, err := middleware.RequireSpaceID(c)
+	if err != nil {
+		errors.JSONError(c, err)
+		return
+	}
+
 	var users []model.User
-	if err := h.db.Find(&users).Error; err != nil {
+	if err := h.db.Model(&model.User{}).
+		Select("users.*").
+		Joins("JOIN memberships ON memberships.user_id = users.id").
+		Where("memberships.space_id = ?", spaceID).
+		Order("users.id ASC").
+		Limit(parseMembersLimit(c.Query("limit"))).
+		Find(&users).Error; err != nil {
 		errors.JSONError(c, err)
 		return
 	}

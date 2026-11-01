@@ -152,3 +152,19 @@ func (s *Service) IsDMChannelParticipant(channelID, userID string) (bool, error)
 	}
 	return count > 0, nil
 }
+
+// OtherParticipant 返回私信频道里「除 userID 之外的另一方」的 userID（1.9.4 task-118）。
+// 非该频道参与者（或频道不是 DM）返回空串，调用方据此跳过通知而不必当成错误。
+func (s *Service) OtherParticipant(channelID, userID string) (string, error) {
+	dm, err := s.dmRepo.GetByChannelID(context.Background(), channelID)
+	if err != nil {
+		return "", database.ClassifyError(err)
+	}
+	switch userID {
+	case dm.UserAID:
+		return dm.UserBID, nil
+	case dm.UserBID:
+		return dm.UserAID, nil
+	}
+	return "", nil
+}

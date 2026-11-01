@@ -52,12 +52,28 @@ export function setClientType(type: 'web' | 'desktop') { CLIENT_TYPE = type; }
 
 const MAX_DEVICE_TYPE_LEN = 32;
 const MAX_DEVICE_NAME_LEN = 64;
+/** 与服务端 auth 侧 maxDeviceIDLen 对齐（server/internal/auth/service.go:345） */
+const MAX_DEVICE_ID_LEN = 64;
 
 let DEVICE_NAME = '';
 
 /** 注入本机设备名（桌面客户端 main.tsx 启动时调用；重复调用以最后一次为准） */
 export function setDeviceName(name: string): void {
   DEVICE_NAME = (name || '').trim();
+}
+
+// task-133：安装级稳定设备标识（桌面客户端由主进程持久化到 <userData>/device-id 后注入；
+// 绿色版自然落在便携 data/ 目录）。web 端无持久化 → 不设置，请求体不带 deviceId（服务端可选）。
+let DEVICE_ID = '';
+
+/** 注入安装级 deviceId（UUIDv4 文本；空串表示未启用/无持久化能力） */
+export function setDeviceId(id: string | null | undefined): void {
+  DEVICE_ID = (id || '').trim();
+}
+
+/** 当前注入的 deviceId（测试/诊断用；未注入为空串） */
+export function getInjectedDeviceId(): string {
+  return DEVICE_ID;
 }
 
 /** 按字符（rune）截断，与服务端 sanitizeSessionDevice 的上限对齐 */
@@ -67,7 +83,7 @@ function truncateRunes(s: string, max: number): string {
 }
 
 /** 组装随 login/refresh 请求上报的设备字段 */
-export function getClientDeviceInfo(): { deviceType: string; deviceName: string } {
+export function getClientDeviceInfo(): { deviceType: string; deviceName: string; deviceId?: string } {
   const deviceType = CLIENT_TYPE === 'desktop' ? 'windows-desktop' : 'web';
   let deviceName = DEVICE_NAME;
   if (!deviceName && typeof navigator !== 'undefined') {
@@ -77,10 +93,13 @@ export function getClientDeviceInfo(): { deviceType: string; deviceName: string 
       deviceName = '';
     }
   }
-  return {
+  const info: { deviceType: string; deviceName: string; deviceId?: string } = {
     deviceType: truncateRunes(deviceType, MAX_DEVICE_TYPE_LEN),
     deviceName: truncateRunes(deviceName, MAX_DEVICE_NAME_LEN),
   };
+  // 服务端字段口径（task-131/68f09d4）：body.deviceId，omitempty —— 未注入则整个字段省略
+  if (DEVICE_ID) info.deviceId = truncateRunes(DEVICE_ID, MAX_DEVICE_ID_LEN);
+  return info;
 }
 
 let refreshingPromise: Promise<string> | null = null;
@@ -1636,6 +1655,131 @@ export const getLeaderboard = (gameType: string, limit = 20) =>
 export const getMyScore = (gameType: string) =>
   apiGet<{ code: string; data: { bestScore: number; updatedAt?: string } }>(
     `/api/v1/minigames/scores/me?gameType=${encodeURIComponent(gameType)}`
+  );
+
+// ── 1.9.4 私信（DM）最小接口 ─────────────────────────────────────────────
+// 服务端契约（`ridgericetalk/server/internal/dm/handler.go`，@275ba1f）：
+//   GET  /api/v1/dm/channels                            → data: Channel[]（type='DM'，
+//        name 固定为 `DM:<userAId>-<userBId>`，客户端据此解析会话对方）
+//   POST /api/v1/dm/channels {recipientId}              → data: Channel（已存在则原样返回，
+//        幂等；不能和自己建会话 → 400）
+//   GET  /api/v1/dm/channels/:id/messages?limit&cursor   → data: {items, hasMore}（limit 默认 50，上限 100）
+//   POST /api/v1/dm/channels/:id/messages {content}      → data: message（完整消息对象；
+//        服务端同时向该会话 WS 广播 {type:'message', payload}）
+// 非会话参与者访问消息 → 403（错误 message 直接可展示）。
+export interface DmChannelItem {
+  id: string;
+  name: string;
+  type: string;
+  spaceId?: string;
+  createdBy?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface DmMessageItem {
+  id: string;
+  channelId: string;
+  userId: string;
+  username?: string;
+  content: string;
+  type?: string;
+  createdAt?: string;
+  attachments?: any[];
+  [key: string]: any;
+}
+
+/** 我的私信会话列表（按 created_at 倒序，服务端保证只含自己参与的会话）。 */
+export const getDmChannels = () =>
+  apiGet<{ code: string; data: DmChannelItem[] }>('/api/v1/dm/channels').then(
+    (res) => ({ ...res, data: res.data || [] }),
+  );
+
+/** 与指定用户建立（或取回已存在的）私信会话。 */
+export const createDmChannel = (recipientId: string) =>
+  apiPost<{ code: string; data: DmChannelItem }>('/api/v1/dm/channels', { recipientId });
+
+/** 拉取私信会话消息（cursor 分页，items 已 normalize 成本端消息形状）。 */
+export const getDmMessages = (channelId: string, opts?: { cursor?: string; limit?: number }) => {
+  const params = new URLSearchParams({ limit: String(opts?.limit ?? 50) });
+  if (opts?.cursor) params.set('cursor', opts.cursor);
+  return apiGet<{ code: string; data: { items: DmMessageItem[]; hasMore: boolean } }>(
+    `/api/v1/dm/channels/${encodeURIComponent(channelId)}/messages?${params.toString()}`,
+  ).then((res) => ({
+    ...res,
+    data: {
+      items: (res.data?.items || []).map(normalizeMessage) as DmMessageItem[],
+      hasMore: !!res.data?.hasMore,
+    },
+  }));
+};
+
+/** 发送私信，返回服务端落库后的完整消息（客户端据此追加到消息流）。 */
+export const sendDmMessage = (channelId: string, content: string) =>
+  apiPost<{ code: string; data: DmMessageItem }>(
+    `/api/v1/dm/channels/${encodeURIComponent(channelId)}/messages`,
+    { content },
+  ).then((res) => ({ ...res, data: normalizeMessage(res.data) as DmMessageItem }));
+
+// ── 1.9.4 通知中心接口（task-118） ───────────────────────────────────────────
+// 服务端契约（ridgericetalk/server/internal/notifications/handler.go）：
+//   GET  /api/v1/notifications?unreadOnly=&limit=&cursor=
+//        → data { notifications: NotificationItem[], unreadCount, nextCursor }
+//        cursor = 上一页最后一条通知的 ID（下一页更旧）；未读数不受分页/unreadOnly 影响
+//   POST /api/v1/notifications/:id/read   → data { message, id, readAt }（幂等，已读时间不覆盖）
+//   POST /api/v1/notifications/read-all   → data { message, updated }（幂等）
+// 服务端一律按登录用户过滤，客户端不传 userId；跨用户标记已读 → 403。
+
+export interface NotificationItem {
+  id: string;
+  type: string;
+  title: string;
+  body: string;
+  refType?: string;
+  refId?: string;
+  spaceId?: string;
+  readAt: string | null;
+  createdAt: string;
+}
+
+export interface NotificationListResult {
+  notifications: NotificationItem[];
+  unreadCount: number;
+  nextCursor: string;
+}
+
+/** 拉取通知列表（默认 20 条，服务端上限 100）。 */
+export const getNotifications = (opts?: {
+  unreadOnly?: boolean;
+  limit?: number;
+  cursor?: string;
+}) => {
+  const params = new URLSearchParams();
+  params.set('limit', String(opts?.limit && opts.limit > 0 ? opts.limit : 20));
+  if (opts?.unreadOnly) params.set('unreadOnly', 'true');
+  if (opts?.cursor) params.set('cursor', opts.cursor);
+  return apiGet<{ code: string; data: NotificationListResult }>(
+    `/api/v1/notifications?${params.toString()}`,
+  ).then((res) => ({
+    ...res,
+    data: {
+      notifications: res.data?.notifications || [],
+      unreadCount: typeof res.data?.unreadCount === 'number' ? res.data.unreadCount : 0,
+      nextCursor: res.data?.nextCursor || '',
+    },
+  }));
+};
+
+/** 单条通知标记已读（返回服务端已读时间；幂等）。 */
+export const markNotificationRead = (id: string) =>
+  apiPost<{ code: string; data: { message: string; id: string; readAt: string | null } }>(
+    `/api/v1/notifications/${encodeURIComponent(id)}/read`,
+  );
+
+/** 全部通知标记已读（返回本次更新条数；幂等）。 */
+export const markAllNotificationsRead = () =>
+  apiPost<{ code: string; data: { message: string; updated: number } }>(
+    '/api/v1/notifications/read-all',
   );
 
 // VirtualNet

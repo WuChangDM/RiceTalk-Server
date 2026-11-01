@@ -6,12 +6,12 @@ package version
 // releases. Bump it whenever the server gains features/changes that clients may need
 // to detect (e.g. new APIs, migrations, or behaviors).
 //
-// Server 是服务端自身的语义版本号，独立于客户端发布节奏递增。它默认为 "0.4.1"，
+// Server 是服务端自身的语义版本号，独立于客户端发布节奏递增。它默认为 "0.4.3"，
 // 但已改为变量以便在编译期通过 -ldflags -X 注入真实构建版本（例如版本 + 短 commit）。
 // 未注入时保持默认值兜底，不影响既有构建流程。注入示例：
 //
-//	go build -ldflags "-X ridgericetalk/core/version.Server=0.4.1+abc1234" ./cmd/server
-var Server = "0.4.1"
+//	go build -ldflags "-X ridgericetalk/core/version.Server=0.4.3+abc1234" ./cmd/server
+var Server = "0.4.3"
 
 // Commit 是编译该二进制时所基于的源码提交短 SHA。
 //

@@ -115,6 +115,8 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 				hands, bottom := e.deal(players)
 				newState["hands"] = hands
 				newState["bottomCards"] = bottom
+				// 1.9.4（task-119）：重开叫分时清空翻明底牌，避免把上一轮底牌带到新一轮。
+				newState["revealedBottomCards"] = []card{}
 				newState["currentPlayer"] = players[0]
 			} else {
 				// 地主收底牌，进入出牌阶段
@@ -123,6 +125,10 @@ func (e *Engine) ValidateMove(state map[string]interface{}, userID string, actio
 				hands[landlord] = append(hands[landlord], bottom...)
 				sort.Slice(hands[landlord], func(i, j int) bool { return hands[landlord][i].Rank < hands[landlord][j].Rank })
 				newState["hands"] = hands
+				// 1.9.4（task-119）：地主确定即「底牌翻明」——把这 3 张单独存到
+				// revealedBottomCards 供客户端渲染；内部 bottomCards 仍按原逻辑清空
+				// （服务端出牌/校验不依赖该字段）。
+				newState["revealedBottomCards"] = append([]card{}, bottom...)
 				newState["bottomCards"] = []card{}
 				newState["phase"] = "play"
 				newState["currentPlayer"] = landlord
@@ -242,7 +248,7 @@ func (e *Engine) SpectatorState(state map[string]interface{}) map[string]interfa
 // PlayerState 返回对局玩家视角的 state（task-109，RUBRIC 红线 #1）。
 // 与 SpectatorState 的差别：保留「本人」手牌明细，其余玩家只给剩余张数，
 // 避免玩家 curl 直读 getState 拿到三家手牌作弊；公共字段（phase/currentPlayer/
-// landlord/bottomCards/lastPlay/winner/pendingScore/universals/turnStartedAt 等）原样保留。
+// landlord/bottomCards/revealedBottomCards/lastPlay/winner/pendingScore/universals/turnStartedAt 等）原样保留。
 // 客户端契约（ridgericetalk-win/src/renderer/components/games/DoudizhuGame.tsx:114-117）：
 // 本人手牌读 hands[myId]，其余玩家读 handCounts[uid]。
 func (e *Engine) PlayerState(state map[string]interface{}, userID string) map[string]interface{} {
@@ -478,6 +484,13 @@ func (e *Engine) handsMap(state map[string]interface{}) map[string][]card {
 
 func (e *Engine) bottomCards(state map[string]interface{}) []card {
 	return parseCardsInterface(state["bottomCards"])
+}
+
+// revealedBottomCards 返回「已翻明的 3 张底牌」（叫地主前为空）。
+// 1.9.4（task-119）：与内部 bottomCards 分离——bottomCards 在地主收牌后清空，
+// 而翻明底牌需要在对局内一直可见（客户端 DoudizhuGame.tsx 翻明区读取该字段）。
+func (e *Engine) revealedBottomCards(state map[string]interface{}) []card {
+	return parseCardsInterface(state["revealedBottomCards"])
 }
 
 func (e *Engine) lastPlay(state map[string]interface{}) []card {

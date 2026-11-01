@@ -4,6 +4,7 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"ridgericetalk/core/errors"
 	"ridgericetalk/core/idgen"
@@ -48,9 +49,14 @@ func (h *Handler) SubmitScore(c *gin.Context) {
 	if isAuthoritativeScored(body.GameType) {
 		bestScore := int64(0)
 		var authoritativeRow model.MinigameLeaderboard
-		if err := h.db.Where("game_type = ? AND user_id = ?", body.GameType, middleware.GetUserID(c)).
-			First(&authoritativeRow).Error; err == nil {
+		err := h.db.Where("game_type = ? AND user_id = ?", body.GameType, middleware.GetUserID(c)).
+			First(&authoritativeRow).Error
+		if err == nil {
 			bestScore = authoritativeRow.BestScore
+		} else if err != gorm.ErrRecordNotFound {
+			// 规则 1：真库故障不能伪装成「当前 0 分」。
+			errors.JSONError(c, errors.ErrInternal)
+			return
 		}
 		errors.Success(c, gin.H{
 			"bestScore":     bestScore,
@@ -70,21 +76,12 @@ func (h *Handler) SubmitScore(c *gin.Context) {
 	order := leaderboardOrder(body.GameType)
 	userID := middleware.GetUserID(c)
 
-	// best returns whether candidate is an improvement over current.
-	best := func(current, candidate int64) bool {
-		if order == "asc" {
-			return candidate < current
-		}
-		return candidate > current
-	}
-
-	// 先读已有记录：既用于单机分数校验的基线，也用于后续 upsert 决策。
-	var existing model.MinigameLeaderboard
-	err := h.db.Where("game_type = ? AND user_id = ?", body.GameType, userID).First(&existing).Error
-	hasExisting := err == nil
-	currentBest := int64(0)
-	if hasExisting {
-		currentBest = existing.BestScore
+	// 先读当前最好成绩：只用于单机分数异常检测（D1 阈值），
+	// 写决策一律走 upsertBestScore 的原子条件更新，避免「先查后写」竞态。
+	currentBest, err := h.currentBestScore(body.GameType, userID)
+	if err != nil {
+		errors.JSONError(c, errors.ErrInternal)
+		return
 	}
 
 	// D1：单机排行榜限分数上限 + 异常暴涨检测（阈值见 score.go 的 singlePlayerScoreCaps）。
@@ -95,36 +92,108 @@ func (h *Handler) SubmitScore(c *gin.Context) {
 		}
 	}
 
-	record := existing
-	updated := false
-	if hasExisting {
-		if best(existing.BestScore, body.Score) {
-			record.BestScore = body.Score
-			if saveErr := h.db.Save(&record).Error; saveErr != nil {
-				errors.JSONError(c, errors.ErrInternal)
-				return
-			}
-			updated = true
-		}
-	} else {
-		record = model.MinigameLeaderboard{
-			ID:        idgen.NextString(),
-			GameType:  body.GameType,
-			UserID:    userID,
-			Username:  "",
-			BestScore: body.Score,
-		}
-		if createErr := h.db.Create(&record).Error; createErr != nil {
-			errors.JSONError(c, errors.ErrInternal)
-			return
-		}
-		updated = true
+	updated, bestScore, err := h.upsertBestScore(body.GameType, userID, body.Score, order)
+	if err != nil {
+		errors.JSONError(c, errors.ErrInternal)
+		return
 	}
 
 	errors.Success(c, gin.H{
-		"bestScore": record.BestScore,
+		"bestScore": bestScore,
 		"updated":   updated,
 	})
+}
+
+// currentBestScore 读该用户在某游戏的当前最好成绩（无记录返回 0）。
+func (h *Handler) currentBestScore(gameType, userID string) (int64, error) {
+	var row model.MinigameLeaderboard
+	err := h.db.Where("game_type = ? AND user_id = ?", gameType, userID).First(&row).Error
+	if err == gorm.ErrRecordNotFound {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return row.BestScore, nil
+}
+
+// upsertBestScore 维护「每人每游戏一条最好成绩」，返回 (是否更新, 更新后的最好成绩, 错误)。
+//
+// 1.9.5 task-138（规则 3）：原实现是「First 查行 → 内存比较 → Save/Create」，并发提交
+// 时两个请求都读到旧值、后写覆盖前写 → 丢最好成绩；错误也被上抛成 500 但读改写本身
+// 不安全。现改为两条原子路径：
+//   - 条件更新：`UPDATE ... SET best_score = ? WHERE ... AND best_score < ?`（asc 为 `>`），
+//     只有「确实更好」才命中，天然并发安全且不会把更好的成绩改差；
+//   - 无行时插入初始行；并发下插入可能撞 PG 唯一约束 → 回退一次条件更新。
+func (h *Handler) upsertBestScore(gameType, userID string, score int64, order string) (bool, int64, error) {
+	better := "best_score < ?"
+	if order == "asc" {
+		better = "best_score > ?"
+	}
+
+	lock := leaderboardKeyLock(gameType, userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	res := h.db.Model(&model.MinigameLeaderboard{}).
+		Where("game_type = ? AND user_id = ? AND "+better, gameType, userID, score).
+		Update("best_score", score)
+	if res.Error != nil {
+		return false, 0, res.Error
+	}
+	if res.RowsAffected > 0 {
+		return true, score, nil
+	}
+
+	// 条件更新 0 行有两种可能：①还没有该用户的行；②已有更好的成绩。
+	// 先区分，避免「已有更好成绩」时误插一行重复记录。
+	exists, err := h.leaderboardRowExists(gameType, userID)
+	if err != nil {
+		return false, 0, err
+	}
+	if exists {
+		best, err := h.currentBestScore(gameType, userID)
+		if err != nil {
+			return false, 0, err
+		}
+		return false, best, nil
+	}
+
+	// 无既有行 → 插入初始行；并发下（跨进程）插入可能撞 PG 唯一约束 → 回退一次条件更新。
+	createErr := h.db.Create(&model.MinigameLeaderboard{
+		ID:        idgen.NextString(),
+		GameType:  gameType,
+		UserID:    userID,
+		BestScore: score,
+	}).Error
+	if createErr == nil {
+		return true, score, nil
+	}
+	retry := h.db.Model(&model.MinigameLeaderboard{}).
+		Where("game_type = ? AND user_id = ? AND "+better, gameType, userID, score).
+		Update("best_score", score)
+	if retry.Error != nil {
+		return false, 0, retry.Error
+	}
+	updated := retry.RowsAffected > 0
+	best, err := h.currentBestScore(gameType, userID)
+	if err != nil {
+		return false, 0, err
+	}
+	return updated, best, nil
+}
+
+// leaderboardRowExists 判断该用户在某游戏是否已有排行榜行（仅取主键，避免整行扫描）。
+func (h *Handler) leaderboardRowExists(gameType, userID string) (bool, error) {
+	var ids []string
+	err := h.db.Model(&model.MinigameLeaderboard{}).
+		Where("game_type = ? AND user_id = ?", gameType, userID).
+		Limit(1).
+		Pluck("id", &ids).Error
+	if err != nil {
+		return false, err
+	}
+	return len(ids) > 0, nil
 }
 
 // GetLeaderboard handles GET /minigames/leaderboard.
@@ -184,12 +253,15 @@ func (h *Handler) GetLeaderboard(c *gin.Context) {
 	}
 	if len(userIDs) > 0 {
 		var users []model.User
-		if err := h.db.Select("id, display_name, username").Where("id IN ?", userIDs).Find(&users).Error; err == nil {
-			for _, u := range users {
-				nameMap[u.ID] = u.DisplayName
-				if nameMap[u.ID] == "" {
-					nameMap[u.ID] = u.Username
-				}
+		// 规则 1：显示名解析失败不再静默降级成空名字，直接 500，避免榜单出现无主成绩。
+		if err := h.db.Select("id, display_name, username").Where("id IN ?", userIDs).Find(&users).Error; err != nil {
+			errors.JSONError(c, errors.ErrInternal)
+			return
+		}
+		for _, u := range users {
+			nameMap[u.ID] = u.DisplayName
+			if nameMap[u.ID] == "" {
+				nameMap[u.ID] = u.Username
 			}
 		}
 	}
@@ -230,9 +302,24 @@ func (h *Handler) GetMyScore(c *gin.Context) {
 	}
 
 	userID := middleware.GetUserID(c)
+	best, err := h.currentBestScore(gameType, userID)
+	if err != nil {
+		errors.JSONError(c, errors.ErrInternal)
+		return
+	}
+	if best == 0 {
+		errors.Success(c, gin.H{"bestScore": 0})
+		return
+	}
+
 	var record model.MinigameLeaderboard
 	if err := h.db.Where("game_type = ? AND user_id = ?", gameType, userID).First(&record).Error; err != nil {
-		errors.Success(c, gin.H{"bestScore": 0})
+		// 规则 1：真库故障不能伪装成「没有成绩」。
+		if err == gorm.ErrRecordNotFound {
+			errors.Success(c, gin.H{"bestScore": 0})
+			return
+		}
+		errors.JSONError(c, errors.ErrInternal)
 		return
 	}
 

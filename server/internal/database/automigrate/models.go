@@ -29,6 +29,7 @@ func AllModels() []interface{} {
 		&model.UserPresence{},
 		&model.UserChannelRead{},
 		&model.MessageThreadRead{}, // A9 二期：线程级已读位（DES-20261029-01 §五；漏加=SQLite 生产零建表）
+		&model.Notification{},      // 1.9.4 task-118：通知中心落库（SQLite 开发环境建表；生产走 000047 迁移，表名必须=GORM 名 notifications）
 		&model.ChannelRolePermission{},
 		&model.OGCache{},
 		&model.VoiceRoom{},
@@ -44,8 +45,9 @@ func AllModels() []interface{} {
 		&model.SharedFolder{},
 		&model.SharedFileEntry{},
 		&model.SharedDocument{},
-		&model.SharedDocumentVersion{}, // M25: 文档版本历史
-		&model.SharedDocumentComment{}, // Phase 2: 文档评论
+		&model.SharedDocumentVersion{},      // M25: 文档版本历史
+		&model.SharedDocumentComment{},      // Phase 2: 文档评论
+		&model.SharedDocumentCollaborator{}, // 1.9.4 A 方案：共享文档协作者（SQLite 开发环境建表；生产走 000045 迁移）
 		&model.ScheduleEvent{},
 		&model.ScheduleEventInvite{}, // A8-S1: 日程事件邀请 RSVP（SQLite 开发环境建表；生产走 000039 迁移）
 		&model.MinigameSession{},

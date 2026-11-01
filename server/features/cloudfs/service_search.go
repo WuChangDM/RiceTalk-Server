@@ -52,6 +52,13 @@ func (s *Service) Search(spaceID, query, scopePath, userID string) ([]CloudFileI
 		return nil, errors.ErrInternal
 	}
 
+	// 规则 2/1：上传者展示名一次批量解析（原先是循环里逐条查 = N+1），
+	// 查询失败上抛而不是静默返回空展示名。
+	uploaders, err := s.displayNamesByUserID(uploadedByIDs(rows))
+	if err != nil {
+		return nil, errors.ErrInternal
+	}
+
 	items := make([]CloudFileItem, 0, len(rows))
 	for i := range rows {
 		f := rows[i]
@@ -61,7 +68,7 @@ func (s *Service) Search(spaceID, query, scopePath, userID string) ([]CloudFileI
 			Type:      "file",
 			Path:      f.FilePath,
 			Size:      formatSize(f.FileSize),
-			UploadBy:  s.displayName(f.UploadedBy),
+			UploadBy:  uploaders[f.UploadedBy],
 			UpdatedAt: f.CreatedAt.Format("2006-01-02 15:04"),
 		})
 	}

@@ -1,6 +1,7 @@
 package livekitmgr
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -71,7 +72,10 @@ func New(log *logger.Logger) *Manager {
 }
 
 // Start discovers the binary, generates config, and starts LiveKit with a watchdog.
-func (m *Manager) Start(cfg *config.Config) error {
+//
+// ctx 只用于约束内嵌 LiveKit 二进制的下载（见 thirdparty.EnsureLiveKit）；
+// 子进程生命周期仍由 Manager 自己的 stop 通道管理。
+func (m *Manager) Start(ctx context.Context, cfg *config.Config) error {
 	m.cfg = cfg
 
 	// Allow explicit opt-out, unless embedded dependency management is enabled.
@@ -93,7 +97,7 @@ func (m *Manager) Start(cfg *config.Config) error {
 		if err != nil {
 			m.log.Warn("[livekit] failed to load versions manifest", "error", err)
 		} else {
-			binPath, err := thirdparty.EnsureLiveKit(versions, cfg.ThirdPartyDir, func(msg string, args ...any) {
+			binPath, err := thirdparty.EnsureLiveKit(ctx, versions, cfg.ThirdPartyDir, func(msg string, args ...any) {
 				m.log.Info(fmt.Sprintf(msg, args...))
 			})
 			if err != nil {

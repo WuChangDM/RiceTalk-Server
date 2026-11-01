@@ -18,10 +18,12 @@ import (
 	"ridgericetalk/features/whiteboard"
 	"ridgericetalk/internal/admin"
 	"ridgericetalk/internal/channel"
+	"ridgericetalk/internal/dm"
 	"ridgericetalk/internal/files"
 	"ridgericetalk/internal/message"
 	"ridgericetalk/internal/metrics"
 	"ridgericetalk/internal/model"
+	"ridgericetalk/internal/notifications"
 	"ridgericetalk/internal/og"
 	"ridgericetalk/internal/remoteassist"
 	"ridgericetalk/internal/screenshare"
@@ -147,6 +149,16 @@ func (a *App) registerAPIRoutes(api *gin.RouterGroup) {
 	messageHandler := message.NewHandler(a.db.DB, a.cfg, a.hub, a.messageService)
 	messageHandler.RegisterRoutes(api)
 
+	// DM (direct message / 私信) routes —— 1.9.4 修复：internal/dm 的 Handler/
+	// Service 一直实现齐全，但此前从未在此注册，导致 GET /api/v1/dm/channels
+	// 恒返回 404 SYSTEM_NOT_FOUND（线上私信功能死路）。DM 频道 type='DM' 不属于
+	// 任何 Space 的可见性模型，因此**不挂** RequireSpaceID / ChannelPermission：
+	// 每条路由在 handler 内部自行按 DM 参与者（user_aid/user_bid）鉴权，并在
+	// RegisterRoutes 里挂了 AuthRequired。复用 message handler 的同一
+	// message.Service 与 realtime.Hub 实例（不要新建第二个 hub，否则广播不互通）。
+	dmHandler := dm.NewHandler(a.db.DB, a.cfg, a.messageService, a.hub)
+	dmHandler.RegisterRoutes(api)
+
 	// CloudFS routes (must be before message archiver injection)
 	a.cloudfsHandler.RegisterRoutes(api)
 
@@ -249,16 +261,8 @@ func (a *App) registerAPIRoutes(api *gin.RouterGroup) {
 		})
 	})
 
-	// Notifications (stub)
-	api.GET("/notifications", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"notifications": []gin.H{}})
-	})
-	api.POST("/notifications/read-all", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"message": "ok"})
-	})
-	api.POST("/notifications/:id/read", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"message": "ok"})
-	})
+	// Notifications 1.9.4 task-118：真实落库 + 已读（此处原为桩实现，只回空列表/ok）
+	notifications.NewHandler(a.db.DB, a.cfg).RegisterRoutes(api)
 
 	// Mention search (stub)
 	api.GET("/mentions/search", func(c *gin.Context) {

@@ -3,6 +3,7 @@ package message
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"strconv"
@@ -12,12 +13,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"ridgericetalk/core/errors"
 	"ridgericetalk/core/httpbind"
+	"ridgericetalk/core/idgen"
 	"ridgericetalk/internal/channel"
 	"ridgericetalk/internal/config"
 	"ridgericetalk/internal/model"
+	"ridgericetalk/internal/notifications"
 	"ridgericetalk/internal/realtime"
 	"ridgericetalk/middleware"
 )
@@ -330,7 +334,7 @@ func (h *Handler) CreateMessage(c *gin.Context) {
 // sendMentionNotifications pushes a mention_notification to every mentioned user
 // and bumps their UserChannelRead.MentionCount (the unread mention counter).
 func (h *Handler) sendMentionNotifications(msg *model.Message) {
-	if h.hub == nil || len(msg.MentionUserIDs) == 0 {
+	if len(msg.MentionUserIDs) == 0 {
 		return
 	}
 	// Snapshot a short content preview for the notification toast.
@@ -342,15 +346,26 @@ func (h *Handler) sendMentionNotifications(msg *model.Message) {
 	if fromDisplay == "" {
 		fromDisplay = msg.AuthorUsername
 	}
+	// 1.9.4 task-118 / 1.9.5 task-136：先把「通知落库 + 提及计数」做完，再考虑 WS 推送。
+	// 两者都是副作用：失败只记告警，绝不影响消息本身是否发送成功。
+	if h.db != nil {
+		notifySvc := notifications.NewService(h.db)
+		for userID := range msg.MentionUserIDs {
+			if userID == msg.UserID {
+				continue // don't notify yourself
+			}
+			if err := notifySvc.NotifyMentionForMessage(msg, userID, fromDisplay); err != nil {
+				log.Printf("[message] persist mention notification failed user=%s channel=%s message=%s: %v", userID, msg.ChannelID, msg.ID, err)
+			}
+			h.bumpMentionCount(userID, msg)
+		}
+	}
+	if h.hub == nil {
+		return
+	}
 	for userID := range msg.MentionUserIDs {
 		if userID == msg.UserID {
 			continue // don't notify yourself
-		}
-		// Bump unread mention count (incremental upsert).
-		if err := h.db.Model(&model.UserChannelRead{}).
-			Where("user_id = ? AND channel_id = ?", userID, msg.ChannelID).
-			Update("mention_count", gorm.Expr("mention_count + 1")).Error; err == nil {
-			// no-op on missing row (user hasn't read this channel yet); fine
 		}
 		// Push real-time notification.
 		payload := map[string]interface{}{
@@ -369,6 +384,40 @@ func (h *Handler) sendMentionNotifications(msg *model.Message) {
 			continue
 		}
 		h.hub.BroadcastToUser(userID, data)
+	}
+}
+
+// bumpMentionCount 原子累加某用户在该频道的提及计数（1.9.5 task-136）。
+//
+// 原实现是 `UPDATE user_channel_reads SET mention_count = mention_count + 1
+// WHERE user_id = ? AND channel_id = ?`：当用户**从未读过该频道**（表里没有对应行）
+// 时命中 0 行、`Error` 仍为 nil，计数被静默丢弃——首次被 @ 的徽标永久丢失，
+// 且之后 MarkChannelRead 建行时又从 0 开始，等于这次提及彻底消失。
+//
+// 这里改为 ON CONFLICT upsert（冲突目标 = 唯一索引 idx_user_channel 的
+// (user_id, channel_id)）：
+//   - 已有行：mention_count + 1（原子自增，不读改写）；
+//   - 无行：建行，unread_count = 1、mention_count = 1（「@ 到就是一条未读」，
+//     与 MarkChannelRead 建行语义对齐；last_read_message_id/read_at 留空，
+//     表示用户尚未真正读过该频道）。
+//
+// 失败只记告警：提及计数是消息发送的副作用，不能让整条消息因此失败。
+func (h *Handler) bumpMentionCount(userID string, msg *model.Message) {
+	read := &model.UserChannelRead{
+		ID:           idgen.NextString(),
+		UserID:       userID,
+		ChannelID:    msg.ChannelID,
+		UnreadCount:  1,
+		MentionCount: 1,
+	}
+	err := h.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "channel_id"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"mention_count": gorm.Expr("mention_count + 1"),
+		}),
+	}).Create(read).Error
+	if err != nil {
+		log.Printf("[message] bump mention count failed user=%s channel=%s message=%s: %v", userID, msg.ChannelID, msg.ID, err)
 	}
 }
 

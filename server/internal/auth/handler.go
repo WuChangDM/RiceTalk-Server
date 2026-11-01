@@ -239,6 +239,9 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		// 携带的设备字段；老客户端不传则继承旧值。
 		DeviceType string `json:"deviceType,omitempty"`
 		DeviceName string `json:"deviceName,omitempty"`
+		// DeviceID 安装级稳定设备标识（task-131，可选）：上报后轮换出的新会话行
+		// 继续携带同一 device_id，「登录设备」不会因 refresh 多出一行。
+		DeviceID string `json:"deviceId,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		errors.JSONError(c, errors.ErrBadRequest.WithDetails("refresh token required"))
@@ -249,6 +252,7 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 	//（「最近活跃 IP」语义），与设备字段的「可选上报、缺省继承」不同——因此
 	// device 始终非 nil（Type/Name 可能为空，service 侧对设备字段保持继承语义）。
 	device := &SessionDevice{
+		DeviceID:  sanitizeDeviceID(body.DeviceID),
 		IP:        sanitizeClientIP(c.ClientIP()),
 		UserAgent: sanitizeUserAgent(c.GetHeader("User-Agent")),
 	}

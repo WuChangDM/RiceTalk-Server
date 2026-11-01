@@ -348,18 +348,48 @@ func (h *Handler) Disconnect(c *gin.Context) {
 	}
 	userID := middleware.GetUserID(c)
 
-	// Find active session in the current space
+	// 1.9.5 task-136：找该用户在当前空间**最近一次会话（不论状态）**，用于区分
+	// 「从未连接」（400）与「已经断开」（幂等 200，含并发重复请求）。
 	var session model.VirtualNetSession
-	if err := h.db.Where("space_id = ? AND user_id = ? AND status = ?", spaceID, userID, "connected").First(&session).Error; err != nil {
-		errors.JSONError(c, errors.New(errors.VIRTUALNET_NOT_CONNECTED, "not connected to virtual network"))
+	err = h.db.Where("space_id = ? AND user_id = ?", spaceID, userID).
+		Order("created_at DESC, id DESC").First(&session).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			errors.JSONError(c, errors.New(errors.VIRTUALNET_NOT_CONNECTED, "not connected to virtual network"))
+			return
+		}
+		errors.JSONError(c, errors.ErrInternal.WithDetails("failed to load virtual network session"))
+		return
+	}
+	if session.Status != "connected" {
+		// 已经是断开状态（含并发请求先一步完成）：幂等成功，不改节点、不重复广播。
+		errors.Success(c, gin.H{"message": "already disconnected"})
 		return
 	}
 
-	// Update session status
-	h.db.Model(&session).Update("status", "disconnected")
+	// 1.9.5 task-136：条件更新 + RowsAffected 判定，替代「先查后无条件写」。
+	// 并发重复 Disconnect 时只有第一个请求真正改变状态（RowsAffected==1），
+	// 其余请求命中 0 行 → 返回 200 幂等，且不重复广播（AGENTS.md 硬规则 3）。
+	res := h.db.Model(&model.VirtualNetSession{}).
+		Where("id = ? AND status = ?", session.ID, "connected").
+		Update("status", "disconnected")
+	if res.Error != nil {
+		errors.JSONError(c, errors.ErrInternal.WithDetails("failed to disconnect virtual network session"))
+		return
+	}
+	if res.RowsAffected == 0 {
+		// 已经被并发请求断开：幂等成功，不重复改节点、不重复广播。
+		errors.Success(c, gin.H{"message": "already disconnected"})
+		return
+	}
 
-	// Update node status
-	h.db.Model(&model.VirtualNetNode{}).Where("session_id = ?", session.ID).Update("status", "inactive")
+	// Update node status（同样条件更新：已 inactive 的节点不再重复写）。
+	if err := h.db.Model(&model.VirtualNetNode{}).
+		Where("session_id = ? AND status <> ?", session.ID, "inactive").
+		Update("status", "inactive").Error; err != nil {
+		errors.JSONError(c, errors.ErrInternal.WithDetails("failed to deactivate virtual network node"))
+		return
+	}
 
 	// C37: Broadcast virtualnet_user_disconnected event to all clients
 	if h.hub != nil {
@@ -518,9 +548,17 @@ func (h *Handler) ReportIP(c *gin.Context) {
 		return
 	}
 
-	// 更新 session 的 IP
-	if err := h.db.Model(&session).Update("ip", body.IP).Error; err != nil {
+	// 1.9.5 task-136：条件更新（status 必须仍是 connected）。若并发 Disconnect 先一步
+	// 把会话断开，这里命中 0 行 → 返回 NOT_CONNECTED 且**不改** DB 中的 ip。
+	res := h.db.Model(&model.VirtualNetSession{}).
+		Where("id = ? AND status = ?", session.ID, "connected").
+		Update("ip", body.IP)
+	if res.Error != nil {
 		errors.JSONError(c, errors.ErrInternal.WithDetails("failed to update session IP"))
+		return
+	}
+	if res.RowsAffected == 0 {
+		errors.JSONError(c, errors.New(errors.VIRTUALNET_NOT_CONNECTED, "not connected to virtual network"))
 		return
 	}
 

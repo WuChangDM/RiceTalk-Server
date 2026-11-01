@@ -135,7 +135,7 @@ server/
 │   ├── channel/                   # 频道与空间管理
 │   ├── config/                    # 配置管理、密钥生成、LiveKit 配置渲染
 │   ├── database/                  # 数据库连接（PostgreSQL/SQLite/SQLCipher）、版本化迁移
-│   ├── dm/                        # 私信历史遗留代码（当前产品未启用，待独立简化）
+│   ├── dm/                        # 私信（DM）：会话创建/列表、消息收发 API（客户端已启用最小入口）
 │   ├── files/                     # 文件上传
 │   ├── infra/                     # 基础设施层：缓存（Ristretto + 内存）、GORM 仓储实现
 │   ├── livekitmgr/                # LiveKit Server SDK 管理器
@@ -144,6 +144,7 @@ server/
 │   ├── metrics/                   # Prometheus 指标与中间件
 │   ├── model/                     # 数据库模型定义（集中）
 │   ├── network/                   # 网络检测、UPnP 端口映射
+│   ├── notifications/             # 通知中心（落库、列表/未读计数、单条与全部已读）
 │   ├── og/                        # Owner/Group 管理
 │   ├── realtime/                  # WebSocket Hub（频道订阅与房间订阅双 map）
 │   ├── remoteassist/              # 远程协助
@@ -177,6 +178,11 @@ server/
 │   ├── deploy-baremetal.sh        # 裸机一键部署（Debian/Ubuntu，支持 NAT 雨云服务器参数）
 │   ├── uninstall-baremetal.sh     # 裸机部署卸载
 │   ├── install-service.sh         # systemd 服务手动安装
+│   ├── build-windows-bundle.ps1   # Windows 服务端分发包（zip：二进制+前端+脚本+离线依赖）
+│   ├── deploy-windows.ps1         # Windows 一键部署（解包/写 .env/防火墙/计划任务/可选开面板）
+│   ├── install-offline.sh         # Linux 离线包安装（离线依赖，无需外网）
+│   ├── build-offline-bundle.sh    # 构建 Linux 离线包（含校验与自检）
+│   ├── download-livekit-win.ps1   # 下载 Windows 版 LiveKit Server（供 win 分发包使用）
 │   ├── setup.sh                   # 开发环境初始化
 │   ├── start-server.sh            # Linux/macOS 一键启动
 │   ├── start-server.ps1           # Windows PowerShell 一键启动
@@ -201,7 +207,7 @@ server/
 
 ### `migrations/` 迁移文件序列
 
-采用 `golang-migrate` 格式（`{version}_{name}.up.sql` / `{version}_{name}.down.sql`），当前序列从 000001 到 000033。关键迁移：000001 baseline、000005 voice_independent、000006 bots_independent、000017 add_livekit_tcp_udp_ports、000019 add_message_attachments、000020 add_security_questions、000031 shared_document_comments、000032 remote_assist_sessions、000033 reconcile_user_presence_table。000033 将历史单数表 `user_presence` 统一为规范表 `user_presences`；两表同时存在时拒绝自动合并。私信历史表保留数据但当前路由未注册，不属于当前产品能力。
+采用 `golang-migrate` 格式（`{version}_{name}.up.sql` / `{version}_{name}.down.sql`），当前序列从 000001 到 000047。关键迁移：000001 baseline、000005 voice_independent、000006 bots_independent、000017 add_livekit_tcp_udp_ports、000019 add_message_attachments、000020 add_security_questions、000031 shared_document_comments、000032 remote_assist_sessions、000033 reconcile_user_presence_table、000044 message_thread_reads（线程权威未读）、000045 sharedoc_collaborators（共享文档协作者）、000046 table_names_align_gorm（表名对齐）、000047 notifications（通知中心）。000033 将历史单数表 `user_presence` 统一为规范表 `user_presences`。私信、通知中心与共享文档协作者均已注册路由并启用（旧库升级由 AutoMigrate/迁移补齐）。
 
 ## 本地开发流程
 
@@ -243,6 +249,17 @@ bash server/scripts/deploy-embedded.sh --public-address http://YOUR_IP:8080
 ```bash
 bash server/scripts/deploy-baremetal.sh
 ```
+
+Windows 服务端分发包（可选，适合办公室/个人 Windows 主机托管）：
+
+```powershell
+# 在本机构建分发包 → 拷到目标机 → 一键部署（管理员 PowerShell）
+.\server\scripts\build-windows-bundle.ps1 -OutDir C:\rrt-bundle
+# 目标机解包后：
+.\scripts\deploy-windows.ps1 -PublicAddress "http://YOUR_IP:8080" -PublicAddressPort 8080
+```
+
+分发包内置 LiveKit Server 与前端产物，部署脚本自动注册计划任务常驻、放通端口并可选自动打开管理面板；`-DryRun` 只检查不改动、`-SkipDeploy` 不覆盖程序文件（仍会写运行期配置并重启）。
 
 详见 `server/scripts/README.md`（部署阶段 Stage 0-9 与参数说明）。
 

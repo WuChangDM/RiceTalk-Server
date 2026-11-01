@@ -613,8 +613,9 @@ func TestUpdateWithoutExpectedVersion(t *testing.T) {
 	}
 }
 
-// TestGetEditorsEmpty verifies M23: GetEditors returns empty list when no editors
-func TestGetEditorsEmpty(t *testing.T) {
+// TestGetEditorsOwnerAlwaysListed verifies 1.9.4 A 方案：协作者清单为空时
+// 仍固定包含 owner（role=owner、online 按在线会话），不再返回空列表。
+func TestGetEditorsOwnerAlwaysListed(t *testing.T) {
 	_, r, db := setupTestHandler()
 
 	doc := createTestDoc(db, "标题", "内容")
@@ -635,30 +636,43 @@ func TestGetEditorsEmpty(t *testing.T) {
 	if data == nil {
 		t.Fatal("expected data object in response")
 	}
-	if data["count"].(float64) != 0 {
-		t.Errorf("expected count=0, got %v", data["count"])
+	if data["count"].(float64) != 1 {
+		t.Errorf("expected count=1 (owner only), got %v", data["count"])
 	}
 	editors, _ := data["editors"].([]interface{})
-	if len(editors) != 0 {
-		t.Errorf("expected empty editors list, got %d items", len(editors))
+	if len(editors) != 1 {
+		t.Fatalf("expected 1 editor (owner), got %d items", len(editors))
+	}
+	first, _ := editors[0].(map[string]interface{})
+	if first["userId"] != "user-1" {
+		t.Errorf("expected first editor userId=user-1, got %v", first["userId"])
+	}
+	if first["role"] != "owner" {
+		t.Errorf("expected first editor role=owner, got %v", first["role"])
+	}
+	if first["online"] != false {
+		t.Errorf("expected owner online=false without editor session, got %v", first["online"])
 	}
 }
 
-// TestGetEditorsWithEditors verifies M23: GetEditors returns list after AddEditor called
-func TestGetEditorsWithEditors(t *testing.T) {
-	h, r, db := setupTestHandler()
+// TestGetEditorsWithCollaborators verifies 1.9.4 A 方案：协作者清单来自
+// shared_document_collaborators 持久化表（GORM 默认表名），owner 恒在首位，撤销后数量回落。
+func TestGetEditorsWithCollaborators(t *testing.T) {
+	_, r, db := setupTestHandler()
 
 	doc := createTestDoc(db, "标题", "内容")
 
-	// 模拟两个用户加入编辑
-	h.AddEditor(doc.ID, "user-1")
-	h.AddEditor(doc.ID, "user-2")
-	// 重复调用 AddEditor 不应重复添加
-	h.AddEditor(doc.ID, "user-1")
-
-	// 创建 user-2 用户记录以便查询用户名
-	if err := db.Create(&model.User{ID: "user-2", Username: "alice", Email: "alice@test.com", PasswordHash: "x"}).Error; err != nil {
+	// 授权 user-2 为 editor（线上由 AddCollaborator 写入，这里直接落库）
+	if err := db.Create(&model.User{
+		ID: "user-2", Username: "alice", Email: "alice@test.com", PasswordHash: "x",
+		DisplayName: "Alice",
+	}).Error; err != nil {
 		t.Fatalf("failed to create user: %v", err)
+	}
+	if err := db.Create(&model.SharedDocumentCollaborator{
+		ID: "collab-1", DocID: doc.ID, UserID: "user-2", Role: "editor",
+	}).Error; err != nil {
+		t.Fatalf("failed to create collaborator: %v", err)
 	}
 
 	req := httptest.NewRequest("GET", "/api/v1/sharedoc/"+doc.ID+"/editors", nil)
@@ -682,11 +696,25 @@ func TestGetEditorsWithEditors(t *testing.T) {
 	}
 	editors, _ := data["editors"].([]interface{})
 	if len(editors) != 2 {
-		t.Errorf("expected 2 editors, got %d", len(editors))
+		t.Fatalf("expected 2 editors, got %d", len(editors))
+	}
+	first, _ := editors[0].(map[string]interface{})
+	if first["userId"] != "user-1" || first["role"] != "owner" {
+		t.Errorf("expected owner first, got %v", first)
+	}
+	second, _ := editors[1].(map[string]interface{})
+	if second["userId"] != "user-2" || second["role"] != "editor" {
+		t.Errorf("expected user-2 as editor, got %v", second)
+	}
+	if second["username"] != "Alice" {
+		t.Errorf("expected username Alice, got %v", second["username"])
 	}
 
-	// 验证 RemoveEditor 后数量减少
-	h.RemoveEditor(doc.ID, "user-1")
+	// 撤销授权后清单回落为只有 owner
+	if err := db.Where("doc_id = ? AND user_id = ?", doc.ID, "user-2").
+		Delete(&model.SharedDocumentCollaborator{}).Error; err != nil {
+		t.Fatalf("failed to delete collaborator: %v", err)
+	}
 	req2 := httptest.NewRequest("GET", "/api/v1/sharedoc/"+doc.ID+"/editors", nil)
 	w2 := httptest.NewRecorder()
 	r.ServeHTTP(w2, req2)
@@ -1002,9 +1030,16 @@ func TestCreateCommentDeniedForNonSpaceMember(t *testing.T) {
 }
 
 // TestEditorCleanupOnUserOffline verifies that editor sessions are cleaned when user goes fully offline.
+// 1.9.4 A 方案后清单成员来自持久化协作者表，离线只影响 online 标记，不影响成员。
 func TestEditorCleanupOnUserOffline(t *testing.T) {
 	h, r, db := setupTestHandler()
 	doc := createTestDoc(db, "标题", "内容")
+
+	if err := db.Create(&model.SharedDocumentCollaborator{
+		ID: "collab-1", DocID: doc.ID, UserID: "user-2", Role: "editor",
+	}).Error; err != nil {
+		t.Fatalf("failed to create collaborator: %v", err)
+	}
 
 	h.AddEditor(doc.ID, "user-1")
 	h.AddEditor(doc.ID, "user-2")
@@ -1022,8 +1057,22 @@ func TestEditorCleanupOnUserOffline(t *testing.T) {
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	data, _ := resp["data"].(map[string]interface{})
-	if data["count"].(float64) != 1 {
-		t.Errorf("expected 1 editor after cleanup, got %v", data["count"])
+	if data["count"].(float64) != 2 {
+		t.Errorf("expected 2 editors after cleanup, got %v", data["count"])
+	}
+	editors, _ := data["editors"].([]interface{})
+	for _, item := range editors {
+		e, _ := item.(map[string]interface{})
+		switch e["userId"] {
+		case "user-1":
+			if e["online"] != false {
+				t.Errorf("expected user-1 online=false after full offline, got %v", e["online"])
+			}
+		case "user-2":
+			if e["online"] != true {
+				t.Errorf("expected user-2 online=true, got %v", e["online"])
+			}
+		}
 	}
 }
 

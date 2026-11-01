@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -596,6 +597,19 @@ func (h *Handler) persistSessionState(session *model.MinigameSession, prevState 
 	return nil
 }
 
+// isGameControlAction 报告是否为对局控制类动作（认输 / 求和 / 悔棋）。
+//
+// 这类动作在「已结束房间」上的处理与普通走子不同：
+// resign 重复提交要幂等（200，不重复结算/写历史），其余返回 GAME_ALREADY_ENDED。
+func isGameControlAction(action string) bool {
+	switch action {
+	case "resign", "draw_offer", "draw_accept", "draw_reject",
+		"undo_request", "undo_accept", "undo_reject":
+		return true
+	}
+	return false
+}
+
 // Action records a game action and updates session state.
 // Only players can submit actions; spectators are not allowed.
 func (h *Handler) Action(c *gin.Context) {
@@ -705,6 +719,23 @@ func (h *Handler) Action(c *gin.Context) {
 	var endedWinnerID string
 	var endedIsDraw bool
 
+	// 1.9.4 task-122：对局控制动作（认输/求和/悔棋）在已结束房间上的口径。
+	// resign 重复提交返回 200（幂等，不重复结算/不重复写历史）；
+	// 其余控制动作返回 MINIGAME_GAME_ALREADY_ENDED，避免把终局当进行中处理。
+	if session.Status == "ended" && isGameControlAction(body.Action) {
+		if body.Action == "resign" {
+			errors.Success(c, gin.H{
+				"message":    "action received",
+				"sessionId":  session.ID,
+				"status":     session.Status,
+				"idempotent": true,
+			})
+			return
+		}
+		errors.JSONError(c, errors.New(errors.MINIGAME_GAME_ALREADY_ENDED, "game already ended"))
+		return
+	}
+
 	// For all gameplay actions (except game_start/game_restart which are handled above),
 	// forward to the engine's ValidateMove. Each engine declares its own
 	// action vocabulary (move_made/roll_dice/move_pawn/bid/play/werewolf_kill/
@@ -723,9 +754,16 @@ func (h *Handler) Action(c *gin.Context) {
 		state := parseState(session.State)
 		newState, err := engine.ValidateMove(state, userID, body.Action, body.Payload)
 		if err != nil {
+			// 控制类动作的语义错误映射成精确错误码，避免客户端把「没棋可悔 /
+			// 不是你的手」误判成「还没轮到你」。
 			code := errors.MINIGAME_INVALID_ACTION
-			if err == util.ErrNotYourTurn {
+			switch err {
+			case util.ErrNotYourTurn:
 				code = errors.MINIGAME_NOT_YOUR_TURN
+			case util.ErrNoMoveToUndo:
+				code = errors.MINIGAME_NO_MOVE_TO_UNDO
+			case util.ErrNotLastMover:
+				code = errors.MINIGAME_NOTHING_TO_UNDO
 			}
 			errors.JSONError(c, errors.New(code, err.Error()))
 			return
@@ -774,7 +812,10 @@ func (h *Handler) Action(c *gin.Context) {
 
 	// §15.4: 游戏结束时写入历史记录（写入失败不影响主流程）
 	if gameEnded {
-		h.finishGame(&session, endedWinnerID, endedIsDraw)
+		if err := h.finishGame(&session, endedWinnerID, endedIsDraw); err != nil {
+			log.Printf("[minigames] 结算权威计分失败 session=%s game=%s winner=%s: %v",
+				session.ID, session.GameType, endedWinnerID, err)
+		}
 	}
 
 	broadcast := map[string]interface{}{
@@ -875,7 +916,10 @@ func (h *Handler) GetState(c *gin.Context) {
 					// 乐观锁写入，避免与并发 Action 互相覆盖。
 					if err := h.persistSessionState(&session, prevState); err == nil {
 						if endedNow {
-							h.finishGame(&session, winnerID, draw)
+							if err := h.finishGame(&session, winnerID, draw); err != nil {
+								log.Printf("[minigames] 结算权威计分失败 session=%s game=%s winner=%s: %v",
+									session.ID, session.GameType, winnerID, err)
+							}
 						}
 						h.broadcastToRoom(session.ID, map[string]interface{}{
 							"gameId":    session.ID,
@@ -1177,7 +1221,10 @@ func (h *Handler) tickTimedGames() {
 			continue
 		}
 		if ended {
-			h.finishGame(s, winnerID, draw)
+			if err := h.finishGame(s, winnerID, draw); err != nil {
+				log.Printf("[minigames] 结算权威计分失败 session=%s game=%s winner=%s: %v",
+					s.ID, s.GameType, winnerID, err)
+			}
 		}
 		h.broadcastToRoom(s.ID, map[string]interface{}{
 			"gameId":    s.ID,

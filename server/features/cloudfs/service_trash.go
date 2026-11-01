@@ -108,6 +108,14 @@ func (s *Service) removeTrashContent(physicalName string) {
 	os.Remove(filepath.Join(s.baseDir(), physicalName))
 }
 
+// 回收站列表上限（1.9.5 task-138，规则 2）：响应最多 trashListDefaultLimit 条，
+// 数据库侧最多捞 trashListMaxLimit 条（留余量给「文件夹 + 文件」合并排序）。
+// 超限静默截断（不加 page/cursor 参数，响应结构不变）。
+const (
+	trashListDefaultLimit = 200
+	trashListMaxLimit     = 1000
+)
+
 // ListTrash returns the space's top-level deleted folders and files, newest
 // first.
 func (s *Service) ListTrash(spaceID, userID string) ([]TrashItem, error) {
@@ -129,7 +137,16 @@ func (s *Service) ListTrash(spaceID, userID string) ([]TrashItem, error) {
 	var files []model.SharedFileEntry
 	if err := s.db.Unscoped().
 		Where("space_id = ? AND deleted_at IS NOT NULL", spaceID).
-		Order("deleted_at DESC").Find(&files).Error; err != nil {
+		Order("deleted_at DESC").
+		Limit(trashListMaxLimit).
+		Find(&files).Error; err != nil {
+		return nil, errors.ErrInternal
+	}
+
+	// 规则 2/1：回收站列表里的上传者展示名同样一次批量解析（原先是循环内逐条查），
+	// 查询失败上抛，不再静默返回空展示名。
+	uploaders, err := s.displayNamesByUserID(uploadedByIDs(files))
+	if err != nil {
 		return nil, errors.ErrInternal
 	}
 
@@ -166,32 +183,22 @@ func (s *Service) ListTrash(spaceID, userID string) ([]TrashItem, error) {
 			Type:      "file",
 			Path:      f.FilePath,
 			Size:      formatSize(f.FileSize),
-			UploadBy:  s.displayName(f.UploadedBy),
+			UploadBy:  uploaders[f.UploadedBy],
 			DeletedAt: f.DeletedAt.Time.Format("2006-01-02 15:04"),
 			ExpiresAt: s.trashExpiry(f.DeletedAt.Time),
 		})
 	}
 
 	sort.SliceStable(items, func(i, j int) bool { return items[i].DeletedAt > items[j].DeletedAt })
+	// 规则 2：响应体积设上限，避免一次把整个回收站返回给客户端。
+	if len(items) > trashListDefaultLimit {
+		items = items[:trashListDefaultLimit]
+	}
 	return items, nil
 }
 
 func (s *Service) trashExpiry(deletedAt time.Time) string {
 	return deletedAt.AddDate(0, 0, s.trashRetentionDays()).Format("2006-01-02 15:04")
-}
-
-func (s *Service) displayName(userID string) string {
-	if userID == "" {
-		return ""
-	}
-	var u model.User
-	if err := s.db.Select("display_name, username").First(&u, "id = ?", userID).Error; err != nil {
-		return ""
-	}
-	if u.DisplayName != "" {
-		return u.DisplayName
-	}
-	return u.Username
 }
 
 // RestoreTrash revives a top-level deleted entry in place. The original path

@@ -7,8 +7,11 @@ package riichi
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"log"
 	"math"
 	"strconv"
 	"time"
@@ -30,8 +33,31 @@ func (e *Engine) Init(players []map[string]interface{}) (map[string]interface{},
 
 // newMatchSeed 生成新对局的牌山 seed（必须 < 2^53，见 InitWithConfig 内注释）。
 //
-// 抽成包级变量仅为让测试注入固定 seed 做确定性断言；生产路径恒为 time.Now()。
-var newMatchSeed = func() int64 { return time.Now().UnixNano() & (core.MaxSeed - 1) }
+// 抽成包级变量仅为让测试注入固定 seed 做确定性断言；生产路径恒为 randomMatchSeed。
+//
+// L-1（1.9.4 安全）：生产路径改用 crypto/rand 取熵，不再用 time.Now().UnixNano()。
+// 纳秒时间戳熵不足（同一毫秒内的并发建房、可预测时钟、进程启动时刻可被推断），
+// 牌山 seed 可被猜中 → 对局公平性受损（可提前知道配牌/自摸顺序）。
+// crypto/rand 失败（极少数平台熵池异常）时回落时间戳，保证 Init 永不因取熵失败而失败；
+// 两种来源都经 seedFromUint64 裁剪到 [0, core.MaxSeed)（JSON float64 往返安全范围）。
+var newMatchSeed = randomMatchSeed
+
+// randomMatchSeed 用系统密码学随机源生成一个合法牌山 seed。
+func randomMatchSeed() int64 {
+	var buf [8]byte
+	_, err := cryptorand.Read(buf[:])
+	if err == nil {
+		return seedFromUint64(binary.LittleEndian.Uint64(buf[:]))
+	}
+	// 兜底：crypto/rand 不可用时退回时间戳（仍保证落在合法区间，不 panic、不阻塞）。
+	// 必须打日志：否则熵源退化为可预测时钟会静默，安全缺陷无从发现。
+	log.Printf("[riichi] crypto/rand 取熵失败，回落到时间戳 seed: %v", err)
+	return seedFromUint64(uint64(time.Now().UnixNano()))
+}
+
+// seedFromUint64 把 64 位随机数/时间戳裁剪到 [0, core.MaxSeed)。
+// 用掩码而非取模：MaxSeed 是 2 的幂，掩码无偏且比取模便宜。
+func seedFromUint64(v uint64) int64 { return int64(v & uint64(core.MaxSeed-1)) }
 
 // InitWithConfig 用指定场制初始化（东/半庄），供建房时传入配置。
 func (e *Engine) InitWithConfig(players []map[string]interface{}, cfg core.Config) (map[string]interface{}, error) {

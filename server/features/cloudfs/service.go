@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"os"
 	"path"
@@ -89,6 +90,74 @@ func formatSize(bytes int64) string {
 	return fmt.Sprintf("%.2f GB", float64(bytes)/(1024*1024*1024))
 }
 
+// cloudFSListWarnThreshold 是 List 的「只告警不截断」阈值。
+//
+// 列表目前没有分页（分页需 UI + openapi 一起改，登记在 1.9.6），超大目录会让
+// 单次响应变得很重；这里留一条可观测线索给运维，但不截断结果，避免静默丢数据。
+const cloudFSListWarnThreshold = 5000
+
+// uploadedByIDs 收集文件条目的上传者 ID（去重、跳过空串）。
+func uploadedByIDs(files []model.SharedFileEntry) []string {
+	ids := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		if f.UploadedBy == "" {
+			continue
+		}
+		if _, ok := seen[f.UploadedBy]; ok {
+			continue
+		}
+		seen[f.UploadedBy] = struct{}{}
+		ids = append(ids, f.UploadedBy)
+	}
+	return ids
+}
+
+// displayNamesByUserID 批量把用户 ID 解析为展示名（displayName，为空回退 username）。
+//
+// 规则 2（禁止循环内 IO）：列表/搜索/回收站原先在循环里逐条 First(&u)，目录里有多少
+// 文件就发多少次查询（N+1）；这里统一先收集 ID、一次 WHERE id IN (?) 批量取回。
+// 规则 1（禁止吞异常）：批量查询失败必须上抛，由调用方转成 errors.ErrInternal；
+// 不能把「查库失败」静默伪装成「该用户没有展示名」。用户不存在（如账号已删除）
+// 仍然不报错，只是 map 里没有该 ID，调用方取到空串——这是既有的展示语义。
+func (s *Service) displayNamesByUserID(userIDs []string) (map[string]string, error) {
+	names := make(map[string]string, len(userIDs))
+	ids := make([]string, 0, len(userIDs))
+	seen := make(map[string]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return names, nil
+	}
+	var users []model.User
+	if err := s.db.Select("id, display_name, username").Where("id IN ?", ids).Find(&users).Error; err != nil {
+		return nil, err
+	}
+	for _, u := range users {
+		name := u.DisplayName
+		if name == "" {
+			name = u.Username
+		}
+		names[u.ID] = name
+	}
+	return names, nil
+}
+
+// warnIfListTooLarge 对超大目录列表发出可观测告警（只告警，不截断）。
+func (s *Service) warnIfListTooLarge(spaceID string, count int) {
+	if count > cloudFSListWarnThreshold {
+		log.Printf("WARN cloudfs list > %d space=%s count=%d", cloudFSListWarnThreshold, spaceID, count)
+	}
+}
+
 func (s *Service) baseDir() string {
 	return filepath.Join(s.cfg.LocalDataPath, "cloudfs")
 }
@@ -156,22 +225,18 @@ func (s *Service) List(spaceID string, listPath string, userID string) ([]CloudF
 		if err := s.db.Where("space_id = ? AND folder_id = ''", spaceID).Find(&files).Error; err != nil {
 			return nil, "", errors.ErrInternal
 		}
+		s.warnIfListTooLarge(spaceID, len(folders)+len(files))
+		uploaders, err := s.displayNamesByUserID(uploadedByIDs(files))
+		if err != nil {
+			return nil, "", errors.ErrInternal
+		}
 		for _, f := range files {
-			var uploadBy string
-			if f.UploadedBy != "" {
-				var u model.User
-				s.db.Select("display_name, username").First(&u, "id = ?", f.UploadedBy)
-				uploadBy = u.DisplayName
-				if uploadBy == "" {
-					uploadBy = u.Username
-				}
-			}
 			items = append(items, CloudFileItem{
 				ID:        f.ID,
 				Name:      f.FileName,
 				Type:      "file",
 				Size:      formatSize(f.FileSize),
-				UploadBy:  uploadBy,
+				UploadBy:  uploaders[f.UploadedBy],
 				UpdatedAt: f.CreatedAt.Format("2006-01-02 15:04"),
 			})
 		}
@@ -204,22 +269,18 @@ func (s *Service) List(spaceID string, listPath string, userID string) ([]CloudF
 		if err := s.db.Where("folder_id = ?", currentFolder.ID).Find(&files).Error; err != nil {
 			return nil, "", errors.ErrInternal
 		}
+		s.warnIfListTooLarge(spaceID, len(folders)+len(files))
+		uploaders, err := s.displayNamesByUserID(uploadedByIDs(files))
+		if err != nil {
+			return nil, "", errors.ErrInternal
+		}
 		for _, f := range files {
-			var uploadBy string
-			if f.UploadedBy != "" {
-				var u model.User
-				s.db.Select("display_name, username").First(&u, "id = ?", f.UploadedBy)
-				uploadBy = u.DisplayName
-				if uploadBy == "" {
-					uploadBy = u.Username
-				}
-			}
 			items = append(items, CloudFileItem{
 				ID:        f.ID,
 				Name:      f.FileName,
 				Type:      "file",
 				Size:      formatSize(f.FileSize),
-				UploadBy:  uploadBy,
+				UploadBy:  uploaders[f.UploadedBy],
 				UpdatedAt: f.CreatedAt.Format("2006-01-02 15:04"),
 			})
 		}

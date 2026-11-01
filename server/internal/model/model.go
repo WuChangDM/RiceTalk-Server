@@ -144,6 +144,11 @@ type UserSession struct {
 	// 均为可选字段，缺省为空串；写入前由 auth.Service 截断（type≤32 / name≤64 rune）。
 	DeviceType string `gorm:"size:32;default:''" json:"deviceType"`
 	DeviceName string `gorm:"size:64;default:''" json:"deviceName"`
+	// DeviceID 是客户端安装级稳定设备标识（UUIDv4，客户端持久化在 userData/device-id，
+	// 绿色版为 data/device-id），task-131。非空时 (user_id, device_id) 唯一：
+	// 同一台设备重复登录会原地更新同一会话行，不再每次登录新增一行。
+	// 空串 = 老客户端未上报，保持旧行为（每次登录新行），由迁移 000048 补列与部分唯一索引。
+	DeviceID string `gorm:"size:64;default:''" json:"deviceId"`
 	// A4-S1（DES-20261001-01 §5.2）：会话来源网络信息。由服务端在登录与
 	// refresh 时自动采集（ip = ClientIP，user_agent = 请求头截断 256 rune），
 	// 客户端不可自报；老会话行为空串。用途：登录设备列表展示来源 IP
@@ -197,6 +202,32 @@ type UserChannelRead struct {
 	UnreadCount       int       `gorm:"default:0" json:"unreadCount"`
 	MentionCount      int       `gorm:"default:0" json:"mentionCount"`
 	ReadAt            time.Time `json:"readAt"`
+}
+
+// Notification 通知中心的一条通知记录（1.9.4 task-118）。
+//
+// 表名由 GORM 默认命名策略推导为 `notifications`（迁移 000047 必须同名，否则
+// 生产 RRT_ENV=production 关闭 AutoMigrate 时会 no such table —— 000045 教训，
+// 守卫见 server/internal/database/migration_table_name_test.go）。
+//
+// 语义：
+//   - Type 取值 mention（@提及）/ dm（私信）/ invite（邀请）/ system（系统公告）；
+//   - RefType + RefID 指向触发来源（mention → message，dm → dm_channel），供客户端跳转；
+//   - SpaceID 仅用于跨 Space 隔离的排查/展示，DM 通知为空串；
+//   - ReadAt 为 nil 表示未读，已读后写时间戳；重复标记已读幂等（不改首次已读时间）。
+type Notification struct {
+	ID      string `gorm:"primaryKey;size:64" json:"id"`
+	UserID  string `gorm:"size:64;not null;index:idx_notifications_user_created,priority:1;index:idx_notifications_user_read,priority:1" json:"userId"`
+	Type    string `gorm:"size:16;not null" json:"type"` // mention | dm | invite | system
+	Title   string `gorm:"size:255;not null" json:"title"`
+	Body    string `gorm:"type:text" json:"body"`
+	RefType string `gorm:"size:32" json:"refType"`
+	RefID   string `gorm:"size:64" json:"refId"`
+	SpaceID string `gorm:"size:64;index:idx_notifications_space" json:"spaceId"`
+	// ReadAt 参与 idx_notifications_user_read 的第二列：未读计数
+	// （user_id = ? AND read_at IS NULL）走该索引。
+	ReadAt    *time.Time `gorm:"index:idx_notifications_user_read,priority:2" json:"readAt"`
+	CreatedAt time.Time  `gorm:"index:idx_notifications_user_created,priority:2" json:"createdAt"`
 }
 
 // UserChannelMute 记录用户对某个频道的静音（T4/S-1 频道级静音）。
@@ -523,6 +554,26 @@ type SharedDocumentComment struct {
 	CreatedAt    time.Time      `json:"createdAt"`
 	UpdatedAt    time.Time      `json:"updatedAt"`
 	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
+}
+
+// SharedDocumentCollaborator 记录共享文档的协作者（1.9.4 A 方案：创建者邀请
+// 同空间成员共同编辑；此前只有 owner 能 PATCH）。
+//
+// 设计约束（与 migrations/000045_sharedoc_collaborators.up.sql 对齐）：
+//   - 表名由 GORM 默认命名策略推导为 shared_document_collaborators（生产
+//     RRT_ENV=production 关闭 AutoMigrate，迁移必须建成同名，否则 PG no such table）；
+//   - owner 不入表：创建者由 SharedDocument.OwnerID 承载，恒有全部权限；
+//   - role 只有 editor（可 PATCH 标题/内容）与 viewer（只读；用于邀请 UI 展示，
+//     与普通空间成员的可见性一致）；
+//   - (doc_id, user_id) 唯一（迁移里是 UNIQUE 约束，SQLite AutoMigrate 走同名
+//     uniqueIndex），重复邀请按 role 覆盖，不做多行分叉。
+type SharedDocumentCollaborator struct {
+	ID        string    `gorm:"primaryKey;size:64" json:"id"`
+	DocID     string    `gorm:"size:64;not null;uniqueIndex:idx_shared_document_collab_doc_user,priority:1" json:"docId"`
+	UserID    string    `gorm:"size:64;not null;uniqueIndex:idx_shared_document_collab_doc_user,priority:2" json:"userId"`
+	Role      string    `gorm:"size:16;not null;default:'editor'" json:"role"` // editor | viewer
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // ScheduleEvent stores calendar events

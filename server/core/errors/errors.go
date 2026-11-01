@@ -218,6 +218,9 @@ const (
 	MINIGAME_GAME_NOT_STARTED    ErrorCode = "MINIGAME_GAME_NOT_STARTED"
 	MINIGAME_GAME_ALREADY_ENDED  ErrorCode = "MINIGAME_GAME_ALREADY_ENDED"
 	MINIGAME_MODULE_DISABLED     ErrorCode = "MINIGAME_MODULE_DISABLED"
+	// 1.9.4 task-122：悔棋的两个精确语义错误（客户端据此区分「没棋可悔」与「不是你的手」）。
+	MINIGAME_NO_MOVE_TO_UNDO ErrorCode = "MINIGAME_NO_MOVE_TO_UNDO"
+	MINIGAME_NOTHING_TO_UNDO ErrorCode = "MINIGAME_NOTHING_TO_UNDO"
 
 	// M27: VirtualNet module dedicated codes (API 错误码规范 §6.15)
 	VIRTUALNET_NOT_FOUND           ErrorCode = "VIRTUALNET_NOT_FOUND"
@@ -473,6 +476,8 @@ var statusCodeMap = map[ErrorCode]int{
 	MINIGAME_GAME_NOT_STARTED:     http.StatusBadRequest,
 	MINIGAME_GAME_ALREADY_ENDED:   http.StatusBadRequest,
 	MINIGAME_MODULE_DISABLED:      http.StatusServiceUnavailable,
+	MINIGAME_NO_MOVE_TO_UNDO:      http.StatusBadRequest,
+	MINIGAME_NOTHING_TO_UNDO:      http.StatusBadRequest,
 
 	// M27: VirtualNet module dedicated codes
 	VIRTUALNET_NOT_FOUND:            http.StatusNotFound,
@@ -884,6 +889,8 @@ var ChineseMessages = map[ErrorCode]string{
 	MINIGAME_GAME_NOT_STARTED:     "游戏尚未开始",
 	MINIGAME_GAME_ALREADY_ENDED:   "游戏已结束",
 	MINIGAME_MODULE_DISABLED:      "小游戏模块已被禁用",
+	MINIGAME_NO_MOVE_TO_UNDO:      "当前没有可悔的棋步",
+	MINIGAME_NOTHING_TO_UNDO:      "只有上一手落子的玩家才能请求悔棋",
 
 	// M27: VirtualNet module dedicated codes
 	VIRTUALNET_NOT_FOUND:            "虚拟网络会话不存在",

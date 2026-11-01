@@ -1,6 +1,7 @@
 package livekitmgr
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -112,7 +113,7 @@ func TestStartProcessExplicitPathNotFound(t *testing.T) {
 		Env:               "development",
 	}
 
-	err := m.Start(cfg)
+	err := m.Start(context.Background(), cfg)
 	if err == nil {
 		t.Fatal("expected Start to fail with non-existent binary path")
 	}
@@ -152,7 +153,7 @@ func TestStartMkdirAllFailure(t *testing.T) {
 		Env:               "development",
 	}
 
-	err := m.Start(cfg)
+	err := m.Start(context.Background(), cfg)
 	if err == nil {
 		t.Fatal("expected Start to fail when LocalDataPath cannot be created")
 	}
